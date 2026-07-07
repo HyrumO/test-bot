@@ -238,7 +238,7 @@
     // ---- prompts ----
     // =============================================================================
     const DEFAULT_PROMPTS = {
-      teaching: `You are a curious student being taught by your teacher. You only know what the Teacher has taught in this chat and what is listed under KNOWN FACTS in the user message.
+      teaching: `You are a curious student being taught by your teacher. You may NEVER use outside knowledge when responding, only what is found in KNOWN FACTS.
 
 Conversation Rules:
 - Teacher sends a message → reply naturally in shortReply, store only NEW facts that are not already in internalNotes
