@@ -1,0 +1,2603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Student Observation Room (Single Question)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            room: { bg: '#0f1419', panel: '#1a2332', accent: '#3b82f6', muted: '#94a3b8' }
+          }
+        }
+      }
+    };
+  </script>
+</head>
+<body class="bg-room-bg text-slate-100 h-screen overflow-hidden font-sans antialiased">
+  <div id="app-root" class="h-full flex flex-col overflow-hidden"></div>
+
+  <script type="module">
+    // =============================================================================
+    // ---- store ----
+    // =============================================================================
+    const FREE_TIER_MODELS = [
+      { id: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash-Lite (preview)' },
+      { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+      { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite' },
+      { id: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' },
+      { id: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
+    ];
+    const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+    const SPEECH_RECOGNITION_SUPPORTED = !!(
+      window.SpeechRecognition || window.webkitSpeechRecognition
+    );
+
+    const KNOWLEDGE_PROFILES = {
+      blank: {
+        id: 'blank',
+        label: 'L0 — Blank slate',
+        description: 'No prior knowledge until you teach.',
+        preloadedNotes: [],
+      },
+      mathPrereqs: {
+        id: 'mathPrereqs',
+        label: 'L1 — Math prerequisites',
+        description: 'Variables, equations, and basic notation.',
+        preloadedNotes: [
+          {
+            concept: 'Variables',
+            facts: ['A variable is a symbol that stands for an unknown or changing value'],
+            links: [],
+          },
+          {
+            concept: 'Equations',
+            facts: ['An equation states that two expressions are equal'],
+            links: ['Variables'],
+          },
+        ],
+      },
+      statsBasics: {
+        id: 'statsBasics',
+        label: 'L1 — Statistics basics',
+        description: 'Foundational statistics vocabulary.',
+        preloadedNotes: [
+          {
+            concept: 'Mean',
+            facts: ['The mean is the average of a set of numbers'],
+            links: [],
+          },
+          {
+            concept: 'Median',
+            facts: ['The median is the middle value when data are ordered'],
+            links: [],
+          },
+        ],
+      },
+    };
+
+    const state = {
+      apiKey: '',
+      knowledgeProfile: 'blank',
+      baselineNotes: [],
+      taughtNotes: [],
+      chat: [],
+      question: null,
+      examAnswers: {},
+      examDeployComplete: false,
+      grades: [],
+      teachingFeedback: null,
+      busy: false,
+      busyLabel: '',
+      error: null,
+      chatPanelTab: 'chat',
+      showQuestionModal: false,
+      statusLine: '',
+      model: FREE_TIER_MODELS[0].id,
+      showSettingsModal: false,
+      confirmDialog: null,
+      voiceMode: false,
+      voiceTtsEnabled: false,
+      voiceSilenceSendMs: 2000,
+      showVoicePrompt: false,
+      voiceStatus: '',
+      liveTranscript: '',
+      liveTranscriptInterim: true,
+      prompts: {},
+    };
+
+    function loadSettings() {
+      state.apiKey = localStorage.getItem('geminiApiKey') || '';
+      const savedModel = localStorage.getItem('geminiModel') || '';
+      if (FREE_TIER_MODELS.some((m) => m.id === savedModel)) {
+        state.model = savedModel;
+      }
+      state.prompts = { ...DEFAULT_PROMPTS };
+      const savedPrompts = localStorage.getItem('geminiPrompts') || '';
+      if (savedPrompts) {
+        try {
+          const parsed = JSON.parse(savedPrompts);
+          for (const key of Object.keys(DEFAULT_PROMPTS)) {
+            if (typeof parsed[key] === 'string') state.prompts[key] = parsed[key];
+          }
+        } catch (_) {}
+      }
+      const savedSilence = Number(localStorage.getItem('voiceSilenceSendMs'));
+      if (Number.isFinite(savedSilence)) {
+        state.voiceSilenceSendMs = clampVoiceSilenceSendMs(savedSilence);
+      }
+      const savedProfile = localStorage.getItem('knowledgeProfile') || 'blank';
+      state.knowledgeProfile = KNOWLEDGE_PROFILES[savedProfile] ? savedProfile : 'blank';
+      reloadBaselineNotes();
+      state.taughtNotes = [];
+    }
+
+    function cloneNotes(notes) {
+      return (notes || []).map((n) => ({
+        concept: String(n.concept || '').trim(),
+        facts: (n.facts || []).filter((f) => typeof f === 'string'),
+        links: (n.links || []).filter((l) => typeof l === 'string'),
+      }));
+    }
+
+    function getAllNotes() {
+      return [...state.baselineNotes, ...state.taughtNotes];
+    }
+
+    function getMemoryNoteCount() {
+      return getAllNotes().length;
+    }
+
+    function formatMemoryBadgeLabel() {
+      const baseline = state.baselineNotes.length;
+      const taught = state.taughtNotes.length;
+      if (baseline && taught) return `${baseline} baseline + ${taught} learned`;
+      if (baseline) return `${baseline} baseline`;
+      if (taught) return `${taught} learned`;
+      return '0 notes';
+    }
+
+    function getKnowledgeProfile() {
+      return KNOWLEDGE_PROFILES[state.knowledgeProfile] || KNOWLEDGE_PROFILES.blank;
+    }
+
+    function reloadBaselineNotes() {
+      state.baselineNotes = cloneNotes(getKnowledgeProfile().preloadedNotes);
+    }
+
+    function setKnowledgeProfile(profileId, { clearTaught = true } = {}) {
+      const profile = KNOWLEDGE_PROFILES[profileId] || KNOWLEDGE_PROFILES.blank;
+      state.knowledgeProfile = profile.id;
+      state.baselineNotes = cloneNotes(profile.preloadedNotes);
+      if (clearTaught) state.taughtNotes = [];
+      localStorage.setItem('knowledgeProfile', profile.id);
+    }
+
+    function renderKnowledgeProfileOptions(selectedId) {
+      return Object.values(KNOWLEDGE_PROFILES)
+        .map(
+          (p) =>
+            `<option value="${escapeHtml(p.id)}" ${selectedId === p.id ? 'selected' : ''}>${escapeHtml(p.label)}</option>`
+        )
+        .join('');
+    }
+    function clampVoiceSilenceSendMs(ms) {
+      return Math.min(5000, Math.max(500, Math.round(ms / 250) * 250));
+    }
+    function saveVoiceSilenceSendMs(ms) {
+      state.voiceSilenceSendMs = clampVoiceSilenceSendMs(ms);
+      localStorage.setItem('voiceSilenceSendMs', String(state.voiceSilenceSendMs));
+    }
+    function formatVoiceSilenceLabel(ms) {
+      return `${(ms / 1000).toFixed(1)} s`;
+    }
+    function saveKey(key) {
+      state.apiKey = key.trim();
+      if (state.apiKey) localStorage.setItem('geminiApiKey', state.apiKey);
+      else localStorage.removeItem('geminiApiKey');
+    }
+    function saveModel(modelId) {
+      const validId = FREE_TIER_MODELS.some((m) => m.id === modelId)
+        ? modelId
+        : FREE_TIER_MODELS[0].id;
+      state.model = validId;
+      localStorage.setItem('geminiModel', validId);
+    }
+    function writePromptsToStorage(prompts) {
+      state.prompts = { ...DEFAULT_PROMPTS, ...prompts };
+      localStorage.setItem('geminiPrompts', JSON.stringify(state.prompts));
+    }
+    function savePrompts(prompts) {
+      writePromptsToStorage(prompts);
+    }
+    function resetPromptsToDefaults() {
+      writePromptsToStorage({});
+    }
+
+    function isPromptCustomized(key, value) {
+      const current = value !== undefined ? value : state.prompts[key] || '';
+      return current !== (DEFAULT_PROMPTS[key] || '');
+    }
+
+    function promptFieldClasses(key, value) {
+      const base =
+        'w-full rounded-lg px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-room-accent outline-none resize-y';
+      return isPromptCustomized(key, value)
+        ? `${base} bg-emerald-950/50 border border-emerald-700/60 text-emerald-50`
+        : `${base} bg-room-bg border border-slate-600`;
+    }
+
+    function persistPromptField(key, value) {
+      writePromptsToStorage({ ...state.prompts, [key]: value });
+    }
+
+    let promptAutosaveTimer = null;
+
+    function applyPromptFieldStyle(el, key) {
+      if (!el) return;
+      const customized = isPromptCustomized(key, el.value);
+      el.className = promptFieldClasses(key, el.value);
+      const badge = root.querySelector(`#prompt-badge-${key}`);
+      if (badge) badge.classList.toggle('hidden', !customized);
+    }
+
+    function wirePromptEditorEvents() {
+      for (const f of PROMPT_FIELDS) {
+        const el = root.querySelector(`#prompt-${f.key}`);
+        if (!el) continue;
+        applyPromptFieldStyle(el, f.key);
+        el.addEventListener('input', () => {
+          applyPromptFieldStyle(el, f.key);
+          clearTimeout(promptAutosaveTimer);
+          promptAutosaveTimer = setTimeout(() => {
+            persistPromptField(f.key, el.value);
+          }, 400);
+        });
+        el.addEventListener('blur', () => {
+          clearTimeout(promptAutosaveTimer);
+          persistPromptField(f.key, el.value);
+        });
+      }
+    }
+
+    // =============================================================================
+    // ---- bracketSeek ----
+    // =============================================================================
+    /**
+     * Extract first balanced JSON object or array from text (handles filler outside).
+     */
+    function bracketSeek(text) {
+      if (!text || typeof text !== 'string') return null;
+      const iObj = text.indexOf('{');
+      const iArr = text.indexOf('[');
+      let start = -1;
+      if (iObj === -1) start = iArr;
+      else if (iArr === -1) start = iObj;
+      else start = Math.min(iObj, iArr);
+      if (start === -1) return null;
+
+      const stack = [];
+      let inStr = false;
+      let strQuote = '';
+      let escaped = false;
+
+      for (let i = start; i < text.length; i++) {
+        const c = text[i];
+
+        if (inStr) {
+          if (escaped) {
+            escaped = false;
+            continue;
+          }
+          if (c === '\\') {
+            escaped = true;
+            continue;
+          }
+          if (c === strQuote) {
+            inStr = false;
+            strQuote = '';
+          }
+          continue;
+        }
+
+        if (c === '"' || c === "'") {
+          inStr = true;
+          strQuote = c;
+          continue;
+        }
+
+        if (c === '{') stack.push('}');
+        else if (c === '[') stack.push(']');
+        else if (c === '}' || c === ']') {
+          if (stack.length && stack[stack.length - 1] === c) {
+            stack.pop();
+            if (stack.length === 0) {
+              return text.slice(start, i + 1);
+            }
+          }
+        }
+      }
+      return null;
+    }
+
+    function parseJsonLoose(text) {
+      const slice = bracketSeek(text);
+      const raw = slice ?? String(text).trim();
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        throw new Error(`Could not parse JSON from model output: ${e.message}`);
+      }
+    }
+
+    // =============================================================================
+    // ---- prompts ----
+    // =============================================================================
+    const DEFAULT_PROMPTS = {
+      teaching: `You are a curious student being taught by your teacher. You may NEVER use outside knowledge when responding, only what is found in WHAT I ALREADY KNOW.
+
+Conversation Rules:
+- Teacher sends a message → reply naturally to their message in shortReply
+- internalNotes is WHAT I LEARNED this turn only — store only NEW facts from the teacher's message that are not already in WHAT I ALREADY KNOW. If nothing new was taught, leave internalNotes facts and links empty.
+- If the teacher ASKS you a question, look only through WHAT I ALREADY KNOW to answer the question.
+- Plan in thinking first (private reasoning). shortReply is your spoken reply to the teacher only — do not put your reply in thinking.
+
+Output ONLY valid JSON (no markdown):
+{
+  "thinking": "Briefly analyze the teacher's input. Decide whether to write any new facts in internalNotes (what I learned), whether the teacher message conflicts with the rules, and what questions to ask if still confused.",
+  "internalNotes": {
+    "concept": "",
+    "facts": []
+  },
+  "shortReply": "",
+  "notesLogSource": []
+}`,
+      answerInference: `Infer a model answer and grading rubric for a single homework question. Output ONLY valid JSON — no markdown, no extra text.
+
+Use your subject knowledge. Default to open_response unless the question text clearly presents selectable multiple-choice options.
+
+For open_response: goldenBullets must be non-empty — one essential grading point per string (~1–2 for concise, 2–5 for elaborate). Set answerDepth "concise" for brief single-ask items, "elaborate" for multi-ask prompts (e.g. "Does…? Why? Explain.").
+
+For multiple_choice: include choices [{id,text}] and correctChoiceId. No goldenBullets.
+
+SCHEMA:
+{
+  "referenceAnswer": string,
+  "goldenBullets": string[],
+  "answerDepth": "concise" | "elaborate",
+  "questionType": "multiple_choice" | "open_response",
+  "choices"?: { "id": string, "text": string }[],
+  "correctChoiceId"?: string,
+  "topic": string
+}`,
+      answerFromTeacher: `Decompose a teacher-provided reference answer into a grading rubric for one homework question. Output ONLY valid JSON — no markdown, no extra text.
+
+Use the question for context. Infer questionType from the question and answer. For open_response, goldenBullets must be non-empty. For multiple_choice, include choices and correctChoiceId if detectable.
+
+SCHEMA:
+{
+  "goldenBullets": string[],
+  "answerDepth": "concise" | "elaborate",
+  "questionType": "multiple_choice" | "open_response",
+  "choices"?: { "id": string, "text": string }[],
+  "correctChoiceId"?: string,
+  "topic": string
+}`,
+      studentExam: `You are a blank slate exam student. You have NO subject knowledge except TEACHING CONTEXT in the user message — memory notes from the teaching chat (each note: concept, FACT lines, LINK lines). You do NOT see the teaching conversation.
+
+STRICT SOURCE RULES:
+1. TEACHING CONTEXT — the ONLY source for concepts, definitions, facts, formulas, and numeric values you assert. Cite 1-based note numbers in memoryNotesUsed.
+2. PROBLEM SETUP — homework stem/code in the user message. Use ONLY to understand what is being asked. It is NOT taught material. Do not read parameters from setup code, simulate data, or apply formulas not written in TEACHING CONTEXT.
+3. PRIOR WORK — if present, earlier sub-part answers on the same question — consistency only; do not treat as automatically correct.
+
+FORBIDDEN: outside/world knowledge, unsupported claims, deriving answers from setup alone.
+
+WHEN UNSURE: memoryNotesUsed: [] and examAnswer "I don't know" (multiple choice: selectedChoiceId "UNKNOWN"). You do not need to elaborate for open response questions when you are unsure.
+
+Each user message specifies question type, ANSWER DEPTH (Concise or Elaborate) for open-response items, and the JSON schema — follow them.
+
+Output ONLY valid JSON per the user message schema.`,
+      grader: `You grade OPEN RESPONSE exam answers only (multiple choice is scored in code).
+
+The exam student had ONLY memory notes (facts and links per concept) — not the teaching chat. Grade whether the written answer hits the rubric using the student answer and goldenBullets provided.
+
+Compare the student's written answer to goldenBullets. A bullet counts as "hit" only if the student clearly and correctly explained that essential point. 1 bullet = 1 point.
+
+If answerDepth is "concise", do NOT penalize brevity — a 1–2 sentence answer can earn full credit if every bullet is clearly hit. If answerDepth is "elaborate", expect fuller reasoning connecting multiple ideas; still grade by bullets, not word count alone.
+
+Output ONLY valid JSON (no markdown, no extra text). Schema:
+{
+  "questionId": string,
+  "hitBullets": number[],
+  "missedBullets": number[],
+  "pointsEarned": number,
+  "pointsPossible": number,
+  "feedback": string
+}
+
+hitBullets and missedBullets are 0-based indices into the provided goldenBullets array. pointsEarned must equal hitBullets.length. pointsPossible must equal goldenBullets.length.`,
+      teachingFeedback: `You are a teaching coach helping a teacher improve their next lesson.
+
+Review MEMORY NOTES (what the student stored from teaching: concept, facts, links per note), test questions, the student's exam answers, and grading results. The exam student only had those notes — not the live chat.
+
+Provide exactly 3 succinct coaching tips for the teacher. Each tip must be ONE sentence maximum.
+
+Tips may suggest: concepts still worth teaching, connections the student missed (including links between ideas), or specific phrases/approaches to help the student grasp material.
+
+Output ONLY valid JSON (no markdown, no extra text):
+{
+  "tips": [string, string, string]
+}`,
+    };
+
+    const PROMPT_FIELDS = [
+      { key: 'teaching', label: 'Teaching (AI Student)', desc: 'Observation Room chat. thinking = private plan; shortReply = visible reply; notesLogSource cites memory when answering teacher questions.' },
+      { key: 'answerInference', label: 'Answer inference', desc: 'When no reference answer is pasted — infer model answer, goldenBullets, and answerDepth from question text.' },
+      { key: 'answerFromTeacher', label: 'Answer from teacher', desc: 'When teacher pastes a reference answer — decompose into goldenBullets and metadata.' },
+      { key: 'studentExam', label: 'Student exam', desc: 'Exam deploy — notes-only student (FACT/LINK memory); follows answerDepth; no teaching chat.' },
+      { key: 'grader', label: 'Grader', desc: 'Open-response rubric grading only (MC scored in app). Respects answerDepth.' },
+      { key: 'teachingFeedback', label: 'Teaching feedback', desc: 'Post-test coaching from memory notes, answers, and grades.' },
+    ];
+
+    function formatStudentTurnForHistory(m) {
+      return String(m.shortReply || '').trim();
+    }
+
+    function buildTeachingUserPayload(teacherLine, priorChat) {
+      let ctx = '';
+      for (const m of priorChat) {
+        if (m.role === 'teacher') ctx += `TEACHER: ${m.text}\n`;
+        else if (m.role === 'student') {
+          ctx += `STUDENT: ${formatStudentTurnForHistory(m)}\n`;
+        }
+      }
+      ctx += `TEACHER: ${teacherLine}\n`;
+      const known = buildTeachingContextBlock();
+      if (known) {
+        ctx += `\nWHAT I ALREADY KNOW (your memory — do not re-store these in internalNotes):\n${known}\n`;
+      } else {
+        ctx += `\nWHAT I ALREADY KNOW: (none yet — you know nothing about the subject)\n`;
+      }
+      return ctx;
+    }
+
+    function parseNotesLogSource(parsed) {
+      const raw = parsed?.notesLogSource ?? parsed?.memoryNotesUsed ?? parsed?.notesUsed;
+      const indices = parseMemoryNotesUsed({
+        memoryNotesUsed: Array.isArray(raw) ? raw : raw != null && raw !== '' ? [raw] : [],
+      });
+      return validateMemoryNotesUsed(indices);
+    }
+
+    function renderTeachingThinkingLine(msg) {
+      const text = String(msg?.thinking || '').trim();
+      return `<details class="mt-1.5 w-full text-xs group">
+        <summary class="cursor-pointer text-slate-500 hover:text-slate-300 select-none list-none flex items-center gap-1.5 px-1 py-0.5 rounded hover:bg-slate-800/60">
+          <span class="text-slate-600 group-open:rotate-90 transition-transform inline-block text-[10px]">▸</span>
+          <span>Show thinking</span>
+        </summary>
+        <div class="mt-1 px-2 py-2 rounded-lg bg-slate-900/80 border border-slate-700/80 text-slate-400 whitespace-pre-wrap">${text ? escapeHtml(text) : '<span class="italic text-slate-600">No thinking recorded for this turn.</span>'}</div>
+      </details>`;
+    }
+
+    function renderTeachingNotesSourceLine(msg) {
+      const used = msg?.notesLogSource;
+      if (!used?.length) return '';
+      const labels = used
+        .map((n) => {
+          const note = getAllNotes()[n - 1];
+          const concept = note?.concept ? escapeHtml(note.concept) : '';
+          return concept ? `Note ${n} (${concept})` : `Note ${n}`;
+        })
+        .join(', ');
+      return `<div class="mt-2 pt-2 border-t border-slate-600/80 text-xs"><span class="text-slate-500">Notes log source:</span> <span class="text-emerald-300/90">${labels}</span></div>`;
+    }
+
+    function removeExamBlocksFromChat() {
+      state.chat = state.chat.filter((m) => m.role !== 'exam_block');
+    }
+
+    function startExamChatBlock() {
+      removeExamBlocksFromChat();
+      const block = { role: 'exam_block', inProgress: true, items: [] };
+      state.chat.push(block);
+      return block;
+    }
+
+    function getExamChatBlock() {
+      for (let i = state.chat.length - 1; i >= 0; i--) {
+        if (state.chat[i].role === 'exam_block') return state.chat[i];
+      }
+      return null;
+    }
+
+    function applyGradesToExamChat(grades) {
+      const block = getExamChatBlock();
+      if (!block) return;
+      for (const g of grades) {
+        const chatItem = block.items.find((it) => it.questionId === g.questionId);
+        if (chatItem) chatItem.grade = { ...g };
+      }
+    }
+
+    function formatGradeScoreDisplay(grade) {
+      if (
+        grade.ungraded ||
+        (grade.questionType === 'open_response' && !grade.pointsPossible)
+      ) {
+        return { text: 'Ungraded (no rubric)', className: 'text-xs font-semibold text-amber-300' };
+      }
+      const scoreClass =
+        grade.pointsEarned === grade.pointsPossible
+          ? 'text-emerald-400'
+          : grade.pointsEarned > 0
+            ? 'text-amber-300'
+            : 'text-red-300';
+      return {
+        text: `${grade.pointsEarned} / ${grade.pointsPossible} pts`,
+        className: `text-xs font-semibold ${scoreClass}`,
+      };
+    }
+
+    function renderGradeFeedbackHtml(g, item) {
+      const bullets = g.goldenBullets || item?.goldenBullets || [];
+      const hitLines =
+        g.questionType === 'multiple_choice'
+          ? g.pointsEarned > 0
+            ? `<li class="text-emerald-300">Correct choice: ${escapeHtml(g.selectedChoiceId || '—')}</li>`
+            : `<li class="text-red-300">Selected ${escapeHtml(g.selectedChoiceId || 'UNKNOWN')}; correct was ${escapeHtml(g.correctChoiceId || '—')}</li>`
+          : (g.hitBullets || [])
+              .map((i) => `<li class="text-emerald-300">${escapeHtml(bullets[i] || `[${i}]`)}</li>`)
+              .join('');
+      const missedLines =
+        g.questionType === 'multiple_choice'
+          ? g.pointsEarned === 0
+            ? `<li class="text-red-300">Expected ${escapeHtml(g.correctChoiceId || '—')}</li>`
+            : ''
+          : (g.missedBullets || [])
+              .map((i) => `<li class="text-red-300">${escapeHtml(bullets[i] || `[${i}]`)}</li>`)
+              .join('');
+      return `
+        ${g.feedback ? `<p class="text-slate-300 mb-2">${escapeHtml(g.feedback)}</p>` : ''}
+        ${hitLines ? `<div class="text-slate-500 mb-1">Earned</div><ul class="space-y-0.5 mb-2">${hitLines}</ul>` : ''}
+        ${missedLines ? `<div class="text-slate-500 mb-1">Missed</div><ul class="space-y-0.5">${missedLines}</ul>` : ''}`;
+    }
+
+    function blockItemToExamShape(it) {
+      const meta = findExamItemById(it.questionId);
+      return {
+        id: it.questionId,
+        questionId: it.questionId,
+        label: it.label || meta?.label,
+        displayNumber: it.displayNumber || meta?.displayNumber || '',
+        parentId: it.parentId || meta?.parentId || '',
+        partLabel: it.partLabel || meta?.partLabel || '',
+        parentContext: meta?.parentContext || it.parentContext || '',
+        prompt: it.prompt || meta?.prompt || '',
+        questionType: it.questionType || meta?.questionType || 'open_response',
+        answerDepth: it.answerDepth || meta?.answerDepth || '',
+        choices: it.choices || meta?.choices,
+        answer: it.answer,
+        grade: it.grade,
+      };
+    }
+
+    function isFirstSubPartInExamBlock(it, blockItems) {
+      if (!it.partLabel || !it.parentId) return true;
+      const key = normalizeParentKey(it.parentId);
+      const siblings = blockItems
+        .filter((b) => b.partLabel && normalizeParentKey(b.parentId) === key)
+        .map((b) => ({ partLabel: b.partLabel, questionId: b.questionId }));
+      const sorted = sortSiblingSubParts(siblings);
+      return sorted[0]?.questionId === it.questionId;
+    }
+
+    function isExamInProgress() {
+      const block = getExamChatBlock();
+      return !!block?.inProgress;
+    }
+
+    function renderExamBlockActionsHtml(block) {
+      if (block.inProgress) return '';
+      const hasGrades = state.grades.length > 0;
+      const total = getTotalGradeScore();
+      const feedback = state.teachingFeedback;
+      return `
+        <div class="mt-4 pt-3 border-t border-violet-800/40 flex flex-col gap-2">
+          <button type="button" id="btn-grade" class="w-full py-2 bg-violet-700 hover:bg-violet-600 rounded-lg font-medium text-sm disabled:opacity-50" ${state.busy || !state.examDeployComplete || !Object.keys(state.examAnswers).length ? 'disabled' : ''}>Grade exam</button>
+          ${
+            hasGrades
+              ? `
+          <div class="p-3 rounded-lg bg-slate-800/80 border border-slate-600 text-center">
+            <div class="text-xs text-slate-400">Total score</div>
+            <div class="text-2xl font-bold text-white">${total.earned} / ${total.possible}</div>
+          </div>
+          <button type="button" id="btn-teaching-feedback" class="w-full py-2 bg-amber-800 hover:bg-amber-700 rounded-lg font-medium text-sm disabled:opacity-50" ${state.busy ? 'disabled' : ''}>Ask for teaching feedback</button>
+          ${
+            feedback?.tips?.length
+              ? `<div class="p-3 rounded-lg bg-amber-950/30 border border-amber-900/50">
+            <div class="text-xs uppercase text-amber-300/80 mb-2">Teaching feedback</div>
+            <ol class="list-decimal list-inside space-y-2 text-sm text-slate-200">${feedback.tips.map((tip) => `<li>${escapeHtml(tip)}</li>`).join('')}</ol>
+          </div>`
+              : ''
+          }`
+              : ''
+          }
+        </div>`;
+    }
+
+    function renderExamBlockHtml(block) {
+      const boxClass = block.inProgress
+        ? 'bg-[#060a10] border-2 border-violet-600/50'
+        : 'bg-[#0a1018] border border-violet-800/40';
+      const itemsHtml = block.items
+        .map((rawIt) => {
+          const it = blockItemToExamShape(rawIt);
+          const answerDisplay = it.answer ? formatExamAnswerDisplay(it.answer) : null;
+          const waiting = !answerDisplay && block.inProgress;
+          const grade = it.grade;
+          const showParentContext =
+            it.parentContext && isFirstSubPartInExamBlock(it, block.items);
+          let gradeSection = '';
+          if (grade) {
+            const score = formatGradeScoreDisplay(grade);
+            gradeSection = `
+              <div class="mt-2 pt-2 border-t border-teal-900/60">
+                <div class="flex items-center justify-between gap-2 mb-1">
+                  <span class="${score.className}">${score.text}</span>
+                </div>
+                <details class="text-xs group">
+                  <summary class="cursor-pointer text-violet-300 hover:text-violet-200 select-none list-none flex items-center gap-1">
+                    <span class="text-slate-500 group-open:rotate-90 transition-transform inline-block">▸</span>
+                    Grading details
+                  </summary>
+                  <div class="mt-2 pl-3 border-l border-slate-700">${renderGradeFeedbackHtml(grade, findExamItemById(it.questionId))}</div>
+                </details>
+              </div>`;
+          }
+          return `
+            <div class="space-y-2 pb-3 mb-3 border-b border-slate-800/60 last:border-0 last:mb-0 last:pb-0">
+              <div class="flex justify-end">
+                <div class="max-w-[92%] bg-violet-950/90 border border-violet-700/60 rounded-xl rounded-tr-sm px-3 py-2 text-sm">
+                  <div class="flex flex-wrap items-center gap-2 mb-1">
+                    <span class="text-xs text-violet-300/90">Exam · ${escapeHtml(it.displayNumber ? formatQuestionHeadline(it) : it.label || it.questionId)}</span>
+                    ${it.partLabel ? renderMultistepBadge() : ''}
+                    ${renderQuestionTypeBadge(it.questionType || 'open_response')}
+                    ${it.questionType !== 'multiple_choice' ? renderAnswerDepthBadge(it.answerDepth) : ''}
+                  </div>
+                  ${showParentContext ? renderParentContextBlock(it.parentContext, 'Problem setup / stem') : ''}
+                  <div class="text-violet-50">${escapeHtml(it.prompt)}</div>
+                  ${it.questionType === 'multiple_choice' && it.choices?.length ? renderChoicesList(it.choices) : ''}
+                </div>
+              </div>
+              <div class="flex justify-start">
+                <div class="max-w-[92%] bg-teal-950/80 border border-teal-800/60 rounded-xl rounded-tl-sm px-3 py-2 text-sm">
+                  ${
+                    waiting
+                      ? '<span class="text-teal-300/70 italic text-xs animate-pulse">Student answering…</span>'
+                      : answerDisplay
+                        ? `<div class="text-teal-50 whitespace-pre-wrap">${escapeHtml(answerDisplay)}</div>${renderMemoryNotesUsedLine(it.answer)}`
+                        : '<span class="text-slate-500 italic text-xs">—</span>'
+                  }
+                  ${gradeSection}
+                </div>
+              </div>
+            </div>`;
+        })
+        .join('');
+      return `
+        <div class="${boxClass} rounded-xl p-4 my-3">
+          <div class="text-xs uppercase tracking-wide mb-3 flex items-center gap-2">
+            <span class="text-violet-400">Exam session</span>
+            ${block.inProgress ? '<span class="text-amber-400/90 animate-pulse">In progress…</span>' : '<span class="text-slate-500">Complete</span>'}
+          </div>
+          ${itemsHtml || '<p class="text-slate-500 text-xs">Starting exam…</p>'}
+          ${renderExamBlockActionsHtml(block)}
+        </div>`;
+    }
+
+    function renderChatMessagesHtml() {
+      const hasContent = state.chat.some(
+        (m) => m.role === 'teacher' || m.role === 'student' || m.role === 'exam_block'
+      );
+      if (!hasContent) {
+        return `<p class="text-slate-500 text-sm">Teach the AI from absolute zero. It may ask follow-up questions when something is unclear.</p>`;
+      }
+      return state.chat
+        .map((m) => {
+          if (m.role === 'exam_block') return renderExamBlockHtml(m);
+          if (m.role === 'teacher') {
+            return `<div class="flex justify-end"><div class="max-w-[85%] bg-blue-600/30 border border-blue-500/40 rounded-2xl rounded-tr-sm px-4 py-2 text-sm">${escapeHtml(m.text)}</div></div>`;
+          }
+          if (m.role === 'student') {
+            const studentText = formatStudentTurnForHistory(m);
+            return `<div class="flex justify-start max-w-[85%]">
+              <div class="flex flex-col w-full">
+                <div class="bg-slate-800 border border-slate-700 rounded-2xl rounded-tl-sm px-4 py-2 text-sm">
+                  <div class="whitespace-pre-wrap">${escapeHtml(studentText)}</div>
+                  ${renderTeachingNotesSourceLine(m)}
+                </div>
+                ${renderTeachingThinkingLine(m)}
+              </div>
+            </div>`;
+          }
+          return '';
+        })
+        .join('');
+    }
+
+    function buildTeachingContextBlock() {
+      const lines = [];
+      getAllNotes().forEach((n, idx) => {
+        lines.push(`--- Note ${idx + 1}: ${n.concept || 'concept'} ---`);
+        (n.facts || []).forEach((f) => lines.push(`FACT: ${f}`));
+        (n.links || []).forEach((l) => lines.push(`LINK: ${l}`));
+      });
+      return lines.join('\n');
+    }
+
+    function comparePartLabels(a, b) {
+      const la = String(a?.partLabel || '').toLowerCase();
+      const lb = String(b?.partLabel || '').toLowerCase();
+      if (la && lb) return la.localeCompare(lb);
+      return String(a?.displayNumber || a?.id || '').localeCompare(
+        String(b?.displayNumber || b?.id || '')
+      );
+    }
+
+    function sortSiblingSubParts(items) {
+      return [...items].sort(comparePartLabels);
+    }
+
+    /** Deploy sub-parts in letter order (a→b→c) regardless of analyzer array order. */
+    function orderExamItemsForDeploy(items) {
+      const result = [];
+      const processedParents = new Set();
+      for (const item of items) {
+        if (item.parentId && item.partLabel) {
+          if (processedParents.has(item.parentId)) continue;
+          processedParents.add(item.parentId);
+          const siblings = sortSiblingSubParts(
+            items.filter((it) => it.parentId === item.parentId && it.partLabel)
+          );
+          result.push(...siblings);
+        } else {
+          result.push(item);
+        }
+      }
+      return result;
+    }
+
+    function normalizeHitBullets(hits, possible) {
+      const valid = [];
+      const seen = new Set();
+      for (const h of Array.isArray(hits) ? hits : []) {
+        if (!Number.isInteger(h) || h < 0 || h >= possible || seen.has(h)) continue;
+        seen.add(h);
+        valid.push(h);
+      }
+      return valid.sort((a, b) => a - b);
+    }
+
+    function getSiblingSubParts(parentId) {
+      if (!parentId) return [];
+      return sortSiblingSubParts(
+        buildExamItemsList().filter((it) => it.parentId === parentId && it.partLabel)
+      );
+    }
+
+    function buildPriorSubPartWorkBlock(currentItem, examAnswers = state.examAnswers) {
+      if (!currentItem?.parentId) return '';
+      const siblings = getSiblingSubParts(currentItem.parentId);
+      const currentIdx = siblings.findIndex((it) => it.id === currentItem.id);
+      if (currentIdx <= 0) return '';
+
+      const prior = siblings.slice(0, currentIdx).filter((it) => {
+        const ans = examAnswers[it.id];
+        return ans != null && getExamAnswerText(ans).trim();
+      });
+      if (!prior.length) return '';
+
+      const parentNum =
+        String(currentItem.displayNumber || '').replace(/[a-z]$/i, '') || currentItem.parentId;
+      const sections = prior.map((it) => {
+        const label = it.displayNumber || it.partLabel || it.id;
+        return `--- ${label} ---\nQuestion: ${it.prompt}\nYour answer: ${getExamAnswerText(examAnswers[it.id])}`;
+      });
+
+      return `PRIOR WORK (question ${parentNum}):\n\n${sections.join('\n\n')}`;
+    }
+
+    function buildExamUserMessage(item, examAnswers = state.examAnswers) {
+      const ctx = buildTeachingContextBlock() || '(empty — you have not been taught anything yet)';
+      const priorWork = buildPriorSubPartWorkBlock(item, examAnswers);
+      const priorBlock = priorWork ? `\n\n${priorWork}` : '';
+      const fullPrompt = buildFullExamPrompt(item);
+      if (item.questionType === 'multiple_choice') {
+        const choices = item.choices || [];
+        const choicesBlock = choices.map((c) => `${c.id}) ${c.text}`).join('\n');
+        return `TEACHING CONTEXT:
+${ctx}${priorBlock}
+
+QUESTION TYPE: multiple_choice
+
+${fullPrompt}
+
+OPTIONS:
+${choicesBlock}`;
+      }
+      return `TEACHING CONTEXT:
+${ctx}${priorBlock}
+
+QUESTION TYPE: open_response
+
+${buildExamAnswerDepthInstruction(item)}
+
+${fullPrompt}`;
+    }
+
+    function getTotalGradeScore() {
+      let earned = 0;
+      let possible = 0;
+      for (const g of state.grades) {
+        earned += g.pointsEarned;
+        possible += g.pointsPossible;
+      }
+      return { earned, possible };
+    }
+
+    function buildTeachingFeedbackUserContent() {
+      const items = buildExamItemsList();
+      const gradeById = Object.fromEntries(state.grades.map((g) => [g.questionId, g]));
+      const lines = [
+        'MEMORY NOTES:',
+        buildTeachingContextBlock() || '(none)',
+        '',
+        'TEST RESULTS:',
+      ];
+      for (const item of items) {
+        const g = gradeById[item.id];
+        const ans = formatExamAnswerDisplay(state.examAnswers[item.id]);
+        const headline = formatQuestionHeadline(item);
+        lines.push(`--- ${item.id} (${headline} · ${item.label}) ---`);
+        if (item.parentContext) lines.push(`Shared context: ${item.parentContext}`);
+        lines.push(`Question: ${item.prompt}`);
+        lines.push(`Student answer: ${ans || '(none)'}`);
+        if (g) {
+          lines.push(`Score: ${g.pointsEarned}/${g.pointsPossible}`);
+          if (g.feedback) lines.push(`Grader feedback: ${g.feedback}`);
+        }
+        lines.push('');
+      }
+      const total = getTotalGradeScore();
+      lines.push(`TOTAL: ${total.earned}/${total.possible}`);
+      return lines.join('\n');
+    }
+
+    function buildGraderUserContent(item, studentAnswer) {
+      const fullPrompt = buildFullExamPrompt(item);
+      const priorWork = buildPriorSubPartWorkBlock(item);
+      const priorBlock = priorWork ? `\n\n${priorWork}\n` : '';
+      return `questionId: ${item.id}
+answerDepth: ${item.answerDepth || 'elaborate'}
+QUESTION PROMPT:
+${fullPrompt}${priorBlock}
+
+GOLDEN BULLETS (index order matters):
+${item.goldenBullets.map((b, i) => `[${i}] ${b}`).join('\n')}
+
+STUDENT ANSWER:
+${studentAnswer}`;
+    }
+
+    function normalizeChoices(choices) {
+      if (!Array.isArray(choices)) return [];
+      return choices
+        .map((c, i) => {
+          if (typeof c === 'string') {
+            return { id: String.fromCharCode(65 + i), text: c };
+          }
+          return {
+            id: typeof c?.id === 'string' ? c.id.trim().toUpperCase() : String.fromCharCode(65 + i),
+            text: typeof c?.text === 'string' ? c.text : String(c?.label || ''),
+          };
+        })
+        .filter((c) => c.text);
+    }
+
+    function buildQuestionFromParsed(parsed, prompt, referenceAnswer) {
+      const questionType = normalizeQuestionType(parsed);
+      const choices = questionType === 'multiple_choice' ? normalizeChoices(parsed?.choices) : [];
+      const correctChoiceId =
+        questionType === 'multiple_choice' && typeof parsed?.correctChoiceId === 'string'
+          ? parsed.correctChoiceId.trim().toUpperCase()
+          : '';
+      const goldenBullets = extractGoldenBullets(parsed, questionType);
+      const answerDepth =
+        questionType === 'open_response' ? normalizeAnswerDepth({ ...parsed, prompt }, questionType) : '';
+      return {
+        prompt,
+        referenceAnswer: referenceAnswer || String(parsed?.referenceAnswer || '').trim(),
+        goldenBullets,
+        questionType,
+        choices,
+        correctChoiceId,
+        answerDepth,
+        topic: typeof parsed?.topic === 'string' && parsed.topic.trim() ? parsed.topic.trim() : 'Question',
+      };
+    }
+
+    function shouldShowQuestionModal() {
+      return !!state.apiKey && !state.showSettingsModal && (state.question === null || state.showQuestionModal);
+    }
+
+    function openEditQuestionModal() {
+      if (state.busy) return;
+      state.showQuestionModal = true;
+      render();
+    }
+
+    function normalizeQuestionType(q) {
+      const t = q?.questionType;
+      if (t === 'multiple_choice' || t === 'open_response') return t;
+      if (Array.isArray(q?.choices) && q.choices.length >= 2) return 'multiple_choice';
+      return 'open_response';
+    }
+
+    function inferAnswerDepth(q) {
+      const subPrompt = String(q?.prompt || '').toLowerCase();
+      const full = `${q?.parentContext || ''} ${q?.prompt || ''}`.toLowerCase();
+      const partLabel = q?.partLabel;
+      const qMarks = (full.match(/\?/g) || []).length;
+      const multiAsk = qMarks >= 2 || /\b(why|explain)\b/.test(full);
+      const bullets = Array.isArray(q?.goldenBullets) ? q.goldenBullets.length : 0;
+
+      if (partLabel) {
+        const shortScenario =
+          subPrompt.length < 180 &&
+          !/\b(why|explain|describe|discuss)\b/.test(subPrompt) &&
+          qMarks <= 1;
+        if (shortScenario) return 'concise';
+      }
+
+      if (multiAsk || /\b(explain|describe|discuss)\b/.test(full)) return 'elaborate';
+      if (bullets >= 4) return 'elaborate';
+      if (partLabel && bullets <= 2 && subPrompt.length < 200) return 'concise';
+
+      return partLabel ? 'concise' : 'elaborate';
+    }
+
+    function normalizeAnswerDepth(q, questionType) {
+      if (questionType !== 'open_response') return '';
+      const d = String(q?.answerDepth || '').trim().toLowerCase();
+      if (d === 'concise' || d === 'short') return 'concise';
+      if (d === 'elaborate' || d === 'long' || d === 'full') return 'elaborate';
+      return inferAnswerDepth(q);
+    }
+
+    function buildExamAnswerDepthInstruction(item) {
+      if (item.questionType !== 'open_response') return '';
+      const depth = item.answerDepth || 'elaborate';
+      return `ANSWER DEPTH: ${depth}`;
+    }
+
+    function extractGoldenBullets(q, questionType) {
+      if (questionType !== 'open_response') return [];
+      const candidates = [
+        q?.goldenBullets,
+        q?.golden_bullets,
+        q?.rubric,
+        q?.rubrics,
+        q?.modelAnswerBullets,
+      ];
+      for (const c of candidates) {
+        if (Array.isArray(c)) {
+          const bullets = c.map((b) => String(b).trim()).filter(Boolean);
+          if (bullets.length) return bullets;
+        }
+      }
+      if (typeof q?.modelAnswer === 'string' && q.modelAnswer.trim()) {
+        const lines = q.modelAnswer
+          .split(/\n+/)
+          .map((s) => s.replace(/^\s*[-*•]\s*/, '').replace(/^\d+[.)]\s*/, '').trim())
+          .filter(Boolean);
+        if (lines.length) return lines;
+      }
+      return [];
+    }
+
+    function formatQuestionHeadline(q) {
+      const num = q?.displayNumber || q?.id || '?';
+      return `Question ${num}`;
+    }
+
+    function renderMultistepBadge() {
+      return `<span class="text-xs px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-200 border border-amber-700/50">Sub-part</span>`;
+    }
+
+    function renderParentContextBlock(parentContext, label = 'Shared context') {
+      if (!parentContext) return '';
+      return `<div class="mt-2 mb-2 p-2 rounded bg-slate-900/60 border border-slate-700/80">
+        <div class="text-[10px] uppercase tracking-wide text-slate-500 mb-1">${escapeHtml(label)}</div>
+        <pre class="text-xs text-slate-300 whitespace-pre-wrap font-sans">${escapeHtml(parentContext)}</pre>
+      </div>`;
+    }
+
+    function buildFullExamPrompt(item) {
+      const headline = formatQuestionHeadline(item);
+      if (item.parentContext) {
+        return `${headline}\n\nPROBLEM SETUP:\n${item.parentContext}\n\nSUB-PART ${item.partLabel || item.displayNumber}:\n${item.prompt}`;
+      }
+      return `${headline}\n\n${item.prompt}`;
+    }
+
+    function questionTypeLabel(type) {
+      return type === 'multiple_choice' ? 'Multiple choice' : 'Open response';
+    }
+
+    function answerDepthLabel(depth) {
+      return depth === 'concise' ? 'Concise' : depth === 'elaborate' ? 'Elaborate' : '';
+    }
+
+    function renderQuestionTypeBadge(type) {
+      const isMc = type === 'multiple_choice';
+      return `<span class="text-xs px-1.5 py-0.5 rounded ${
+        isMc
+          ? 'bg-violet-900/50 text-violet-200 border border-violet-700/50'
+          : 'bg-sky-900/50 text-sky-200 border border-sky-700/50'
+      }">${questionTypeLabel(type)}</span>`;
+    }
+
+    function renderAnswerDepthBadge(depth) {
+      if (depth !== 'concise' && depth !== 'elaborate') return '';
+      const isConcise = depth === 'concise';
+      return `<span class="text-xs px-1.5 py-0.5 rounded ${
+        isConcise
+          ? 'bg-emerald-900/40 text-emerald-200 border border-emerald-700/40'
+          : 'bg-amber-900/40 text-amber-200 border border-amber-700/40'
+      }" title="${isConcise ? 'Expect brief 1–2 sentence answer' : 'Expect fuller paragraph-style answer'}">${answerDepthLabel(depth)}</span>`;
+    }
+
+    function renderChoicesList(choices, opts = {}) {
+      const { highlightCorrect, correctId } = opts;
+      if (!choices?.length) return '';
+      return `<ul class="space-y-1 mt-2">${choices
+        .map((c) => {
+          const isCorrect = highlightCorrect && c.id === correctId;
+          return `<li class="text-xs ${isCorrect ? 'text-emerald-300' : 'text-slate-300'}"><span class="font-semibold text-slate-400">${escapeHtml(c.id)})</span> ${escapeHtml(c.text)}${isCorrect ? ' <span class="text-emerald-400">(correct)</span>' : ''}</li>`;
+        })
+        .join('')}</ul>`;
+    }
+
+    function parseNoteToken(token) {
+      const t = String(token || '').trim();
+      if (!t) return [];
+      const rangeMatch = t.match(/^(\d+)\s*[-–]\s*(\d+)$/);
+      if (rangeMatch) {
+        const lo = parseInt(rangeMatch[1], 10);
+        const hi = parseInt(rangeMatch[2], 10);
+        if (!Number.isFinite(lo) || !Number.isFinite(hi)) return [];
+        const out = [];
+        for (let n = Math.min(lo, hi); n <= Math.max(lo, hi); n++) {
+          if (n >= 1) out.push(n);
+        }
+        return out;
+      }
+      const noteMatch = t.match(/^(?:note\s*)?(\d+)$/i);
+      if (noteMatch) {
+        const n = parseInt(noteMatch[1], 10);
+        return n >= 1 ? [n] : [];
+      }
+      return [];
+    }
+
+    function parseMemoryNotesUsed(parsed) {
+      const raw = parsed?.memoryNotesUsed ?? parsed?.notesUsed;
+      if (!Array.isArray(raw)) return [];
+      const notes = [];
+      for (const x of raw) {
+        if (typeof x === 'number' && Number.isInteger(x)) {
+          if (x >= 1) notes.push(x);
+          continue;
+        }
+        const s = String(x).trim();
+        if (!s) continue;
+        const segments = s.split(/\s*(?:,|;|\band\b)\s*/i).filter(Boolean);
+        for (const seg of segments) {
+          notes.push(...parseNoteToken(seg));
+        }
+      }
+      return [...new Set(notes)].sort((a, b) => a - b);
+    }
+
+    function validateMemoryNotesUsed(indices) {
+      const count = getMemoryNoteCount();
+      if (!indices.length || count === 0) return [];
+      return indices.filter((i) => Number.isInteger(i) && i >= 1 && i <= count);
+    }
+
+    function buildExamAnswerFromParsed(item, parsed, examAnswers = state.examAnswers) {
+      const noteIndices = validateMemoryNotesUsed(parseMemoryNotesUsed(parsed));
+      const hadPriorWork = !!buildPriorSubPartWorkBlock(item, examAnswers);
+      let answerObj;
+      if (item.questionType === 'multiple_choice') {
+        answerObj = {
+          questionType: 'multiple_choice',
+          selectedChoiceId: String(parsed.selectedChoiceId || '')
+            .trim()
+            .toUpperCase(),
+          text: parsed.examAnswer != null ? String(parsed.examAnswer) : '',
+          memoryNotesUsed: noteIndices,
+        };
+      } else {
+        answerObj = {
+          questionType: 'open_response',
+          text: parsed.examAnswer != null ? String(parsed.examAnswer) : '',
+          memoryNotesUsed: noteIndices,
+        };
+      }
+      if (noteIndices.length === 0 && !hadPriorWork) {
+        if (answerObj.questionType === 'multiple_choice') {
+          answerObj.selectedChoiceId = 'UNKNOWN';
+        }
+        answerObj.text = "I don't know — no memory notes cited.";
+        answerObj.memoryNotesUsed = [];
+      }
+      return answerObj;
+    }
+
+    function renderMemoryNotesUsedLine(answer) {
+      if (!answer || typeof answer !== 'object') return '';
+      const used = answer.memoryNotesUsed;
+      if (!used?.length) {
+        return `<div class="mt-2 pt-2 border-t border-teal-900/50 text-xs"><span class="text-slate-500">Memory notes used:</span> <span class="text-red-300/90">none</span></div>`;
+      }
+      const labels = used
+        .map((n) => {
+          const note = getAllNotes()[n - 1];
+          const concept = note?.concept ? escapeHtml(note.concept) : '';
+          return concept ? `Note ${n} (${concept})` : `Note ${n}`;
+        })
+        .join(', ');
+      return `<div class="mt-2 pt-2 border-t border-teal-900/50 text-xs"><span class="text-slate-500">Memory notes used:</span> <span class="text-emerald-300/90">${labels}</span></div>`;
+    }
+
+    function formatExamAnswerDisplay(answer) {
+      if (!answer) return '—';
+      if (typeof answer === 'string') return answer;
+      if (answer.questionType === 'multiple_choice') {
+        const sel = answer.selectedChoiceId || '?';
+        return answer.text ? `${sel} — ${answer.text}` : sel;
+      }
+      return answer.text || '—';
+    }
+
+    function getExamAnswerText(answer) {
+      if (!answer) return '';
+      if (typeof answer === 'string') return answer;
+      if (answer.questionType === 'multiple_choice') {
+        return [answer.selectedChoiceId, answer.text].filter(Boolean).join(': ');
+      }
+      return answer.text || '';
+    }
+
+    function findExamItemById(questionId) {
+      return buildExamItemsList().find((x) => x.id === questionId);
+    }
+
+    function renderMemoryNoteCard(n, noteNumber) {
+      return `
+        <div class="border border-slate-700 rounded-lg p-3 bg-slate-800/40">
+          <div class="text-xs text-slate-500 mb-1">Note ${noteNumber}</div>
+          <div class="text-sm font-medium text-slate-200 mb-2">${escapeHtml(n.concept || 'Untitled concept')}</div>
+          ${
+            (n.facts || []).length
+              ? `<div class="mb-2"><div class="text-xs uppercase text-slate-500 mb-1">Facts</div><ul class="list-disc list-inside text-xs text-slate-300 space-y-0.5">${(n.facts || []).map((f) => `<li>${escapeHtml(f)}</li>`).join('')}</ul></div>`
+              : ''
+          }
+          ${
+            (n.links || []).length
+              ? `<div><div class="text-xs uppercase text-slate-500 mb-1">Links</div><ul class="list-disc list-inside text-xs text-slate-400 space-y-0.5">${(n.links || []).map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul></div>`
+              : ''
+          }
+        </div>`;
+    }
+
+    function renderMemorySection(title, description, notes, startIndex) {
+      if (!notes.length) {
+        return `
+          <div>
+            <h3 class="text-sm font-medium text-slate-300 mb-1">${escapeHtml(title)}</h3>
+            <p class="text-xs text-slate-500 mb-2">${escapeHtml(description)}</p>
+            <p class="text-sm text-slate-500 italic">None</p>
+          </div>`;
+      }
+      return `
+        <div>
+          <h3 class="text-sm font-medium text-slate-300 mb-1">${escapeHtml(title)}</h3>
+          <p class="text-xs text-slate-500 mb-2">${escapeHtml(description)}</p>
+          <div class="space-y-3">
+            ${notes.map((n, i) => renderMemoryNoteCard(n, startIndex + i)).join('')}
+          </div>
+        </div>`;
+    }
+
+    function renderMemoryPanel() {
+      const baseline = state.baselineNotes;
+      const taught = state.taughtNotes;
+      if (!baseline.length && !taught.length) {
+        return `<p class="text-slate-500 text-sm">No memory notes yet. Teach the student in the Chat tab — each turn adds hidden notes the exam student can use.</p>`;
+      }
+      return `
+        ${renderMemorySection(
+          'Baseline knowledge',
+          'Preloaded for this knowledge profile. The model sees these as the same memory as learned notes.',
+          baseline,
+          1
+        )}
+        <div class="border-t border-slate-700/80 pt-4">
+          ${renderMemorySection(
+            'Learned this session',
+            'Facts stored during your teaching chat in this session.',
+            taught,
+            baseline.length + 1
+          )}
+        </div>`;
+    }
+
+    // =============================================================================
+    // ---- gemini ----
+    // =============================================================================
+    async function callGemini({ systemInstruction, userText, parts, responseJson, temperature }) {
+      const key = state.apiKey;
+      if (!key) throw new Error('Missing API key');
+
+      const url = `${API_BASE}/${state.model}:generateContent?key=${encodeURIComponent(key)}`;
+
+      const body = {
+        contents: [
+          {
+            role: 'user',
+            parts: parts && parts.length ? parts : [{ text: userText || '' }],
+          },
+        ],
+        generationConfig: {
+          temperature: temperature ?? 0.4,
+          ...(responseJson ? { responseMimeType: 'application/json' } : {}),
+        },
+      };
+      if (systemInstruction) {
+        body.systemInstruction = { parts: [{ text: systemInstruction }] };
+      }
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = data?.error?.message || res.statusText || 'Request failed';
+        throw new Error(msg);
+      }
+
+      const text =
+        data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') ?? '';
+      return text;
+    }
+
+    // =============================================================================
+    // ---- scroll ----
+    // =============================================================================
+    const scrollState = {
+      chatPinnedBottom: true,
+      chatScrollTop: 0,
+      memoryScrollTop: 0,
+    };
+    const uiState = {
+      restoreTeacherInputFocus: false,
+    };
+    const SCROLL_NEAR_BOTTOM_PX = 80;
+
+    function isScrollNearBottom(el, threshold = SCROLL_NEAR_BOTTOM_PX) {
+      if (!el) return true;
+      return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+    }
+
+    function saveScrollPositionsBeforeRender() {
+      const chat = root.querySelector('#chat-scroll');
+      const memory = root.querySelector('#memory-scroll');
+      if (chat) {
+        scrollState.chatScrollTop = chat.scrollTop;
+        scrollState.chatPinnedBottom = isScrollNearBottom(chat);
+      }
+      if (memory) scrollState.memoryScrollTop = memory.scrollTop;
+    }
+
+    function scrollChatToBottom(behavior = 'auto') {
+      const scroll = root.querySelector('#chat-scroll');
+      if (scroll) scroll.scrollTo({ top: scroll.scrollHeight, behavior });
+    }
+
+    function updateChatScrollToBottomButton() {
+      const btn = root.querySelector('#btn-scroll-chat-bottom');
+      const scroll = root.querySelector('#chat-scroll');
+      if (!btn || !scroll) return;
+      btn.classList.toggle('hidden', isScrollNearBottom(scroll));
+    }
+
+    function applyScrollPositionsAfterRender() {
+      if (state.chatPanelTab === 'memory') {
+        const memory = root.querySelector('#memory-scroll');
+        if (memory) memory.scrollTop = scrollState.memoryScrollTop;
+        return;
+      }
+
+      const scroll = root.querySelector('#chat-scroll');
+      if (scroll) {
+        if (scrollState.chatPinnedBottom) {
+          scroll.scrollTop = scroll.scrollHeight;
+        } else {
+          scroll.scrollTop = scrollState.chatScrollTop;
+        }
+        updateChatScrollToBottomButton();
+      }
+      if (state.voiceMode && state.liveTranscript.trim()) patchLiveTranscriptDom();
+
+      if (
+        uiState.restoreTeacherInputFocus &&
+        state.chatPanelTab === 'chat' &&
+        !state.voiceMode &&
+        !state.busy
+      ) {
+        const ta = root.querySelector('#teacher-input');
+        if (ta && !ta.disabled) {
+          ta.focus();
+          uiState.restoreTeacherInputFocus = false;
+        }
+      }
+    }
+
+    function wireScrollHandlers() {
+      const chatScroll = root.querySelector('#chat-scroll');
+      chatScroll?.addEventListener('scroll', () => {
+        scrollState.chatScrollTop = chatScroll.scrollTop;
+        scrollState.chatPinnedBottom = isScrollNearBottom(chatScroll);
+        updateChatScrollToBottomButton();
+      }, { passive: true });
+
+      root.querySelector('#btn-scroll-chat-bottom')?.addEventListener('click', () => {
+        scrollState.chatPinnedBottom = true;
+        scrollChatToBottom('auto');
+        updateChatScrollToBottomButton();
+      });
+    }
+
+    // =============================================================================
+    // ---- ui helpers ----
+    // =============================================================================
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function setBusy(on, label = '') {
+      state.busy = on;
+      state.busyLabel = label;
+      // Clear stale errors only when starting new work.
+      if (on) {
+        state.error = null;
+        if (state.voiceMode) {
+          state.voiceStatus = 'processing';
+          setVoiceInputPaused(true);
+        }
+      }
+      render();
+    }
+
+    function setError(e) {
+      state.error = e?.message || String(e);
+      render();
+    }
+
+    // =============================================================================
+    // ---- voice ----
+    // =============================================================================
+    const root = document.getElementById('app-root');
+    let recognition = null;
+    const voiceSession = {
+      pendingSend: false,
+      suppressOnendTranscript: false,
+      inputPaused: false,
+      browserResultsBaseline: 0,
+      browserResultsLength: 0,
+    };
+    const LIVE_TRANSCRIPT_PLACEHOLDERS = new Set(['Speak now…']);
+    let listenRestartTimer = null;
+    let voiceSilenceSendTimer = null;
+    let networkRetryCount = 0;
+    const MAX_NETWORK_RETRIES = 3;
+    const browserMic = { stream: null };
+
+    async function ensureMicStream() {
+      if (browserMic.stream) {
+        const tracks = browserMic.stream.getAudioTracks();
+        if (tracks.some((t) => t.readyState === 'live')) return browserMic.stream;
+        browserMic.stream.getTracks().forEach((t) => t.stop());
+        browserMic.stream = null;
+      }
+      browserMic.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      return browserMic.stream;
+    }
+
+    function releaseMicStream() {
+      if (browserMic.stream) {
+        browserMic.stream.getTracks().forEach((t) => t.stop());
+        browserMic.stream = null;
+      }
+    }
+
+    function getSpeechRecognition() {
+      const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!Ctor) return null;
+      const r = new Ctor();
+      r.lang = 'en-US';
+      r.continuous = true;
+      r.interimResults = true;
+      r.maxAlternatives = 1;
+      return r;
+    }
+
+    function clearLiveTranscript() {
+      state.liveTranscript = '';
+      state.liveTranscriptInterim = true;
+      const el = root.querySelector('#live-transcript-bubble');
+      if (el) el.remove();
+    }
+
+    function patchLiveTranscriptDom() {
+      const scroll = root.querySelector('#chat-scroll');
+      if (!scroll) return;
+      const text = state.liveTranscript.trim();
+      let el = root.querySelector('#live-transcript-bubble');
+      if (!state.voiceMode || !text) {
+        if (el) el.remove();
+        return;
+      }
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'live-transcript-bubble';
+        el.className = 'flex justify-end';
+        el.innerHTML = `
+          <div class="max-w-[85%] bg-blue-600/20 border border-dashed border-blue-400/60 rounded-2xl rounded-tr-sm px-4 py-2 text-sm">
+            <div id="live-transcript-text" class="text-slate-100"></div>
+            <div id="live-transcript-hint" class="text-xs text-blue-300/80 mt-1"></div>
+          </div>`;
+        scroll.appendChild(el);
+      }
+      const textEl = el.querySelector('#live-transcript-text');
+      const hintEl = el.querySelector('#live-transcript-hint');
+      if (textEl) textEl.textContent = text;
+      if (hintEl) {
+        hintEl.textContent = state.liveTranscriptInterim ? 'Listening…' : 'Sending…';
+      }
+      if (scrollState.chatPinnedBottom) scroll.scrollTop = scroll.scrollHeight;
+    }
+
+    function updateLiveTranscript(text, isInterim) {
+      state.liveTranscript = text;
+      state.liveTranscriptInterim = isInterim;
+      patchLiveTranscriptDom();
+      const ta = root.querySelector('#teacher-input');
+      if (ta) ta.value = text;
+    }
+
+    function patchVoiceStatusChip() {
+      const chip = root.querySelector('#voice-status-chip');
+      if (!chip) return;
+      const label = voiceStatusLabel();
+      chip.textContent = label;
+      const pulse = state.voiceStatus === 'listening';
+      chip.className = `text-xs px-2 py-1 rounded-full border ${
+        state.voiceStatus === 'reconnecting'
+          ? 'bg-amber-900/40 border-amber-700/50 text-amber-200'
+          : 'bg-emerald-900/40 border-emerald-700/50 text-emerald-200'
+      } ${pulse ? 'animate-pulse' : ''}`;
+    }
+
+    function clearVoiceSilenceSendTimer() {
+      if (voiceSilenceSendTimer) {
+        clearTimeout(voiceSilenceSendTimer);
+        voiceSilenceSendTimer = null;
+      }
+    }
+
+    function scheduleVoiceSilenceSend() {
+      clearVoiceSilenceSendTimer();
+      const pending = state.liveTranscript.trim();
+      if (!isSubmittableTranscript(pending)) return;
+      voiceSilenceSendTimer = setTimeout(() => {
+        voiceSilenceSendTimer = null;
+        if (
+          !state.voiceMode ||
+          voiceSession.pendingSend ||
+          state.busy ||
+          voiceSession.inputPaused
+        ) {
+          return;
+        }
+        const text = state.liveTranscript.trim();
+        if (isSubmittableTranscript(text)) submitVoiceTranscript(text);
+      }, state.voiceSilenceSendMs);
+    }
+
+    function submitVoiceTranscript(text) {
+      const trimmed = (text || '').trim();
+      if (!trimmed || voiceSession.pendingSend || state.busy) return;
+      clearVoiceSilenceSendTimer();
+      voiceSession.pendingSend = true;
+      voiceSession.suppressOnendTranscript = true;
+      state.liveTranscriptInterim = false;
+      patchLiveTranscriptDom();
+      clearLiveTranscript();
+      voiceSession.browserResultsBaseline = voiceSession.browserResultsLength;
+      pauseVoiceCapture();
+      const ta = root.querySelector('#teacher-input');
+      if (ta) ta.value = '';
+      sendTeacherText(trimmed);
+    }
+
+    function setVoiceInputPaused(paused) {
+      voiceSession.inputPaused = paused;
+    }
+
+    function pauseVoiceCapture() {
+      clearVoiceSilenceSendTimer();
+      voiceSession.suppressOnendTranscript = true;
+      setVoiceInputPaused(true);
+    }
+
+    function isSubmittableTranscript(text) {
+      const t = (text || '').trim();
+      return t.length > 0 && !LIVE_TRANSCRIPT_PLACEHOLDERS.has(t);
+    }
+
+    function resumeVoiceInput() {
+      if (!state.voiceMode) return;
+      voiceSession.pendingSend = false;
+      voiceSession.suppressOnendTranscript = false;
+      setVoiceInputPaused(false);
+      clearLiveTranscript();
+      state.voiceStatus = 'listening';
+      render();
+
+      const rec = ensureRecognition();
+      if (!rec) return;
+      try {
+        rec.start();
+      } catch (e) {
+        if (e.name === 'InvalidStateError') {
+          patchVoiceStatusChip();
+          return;
+        }
+        scheduleListenRestart(800, { recreate: true });
+        return;
+      }
+      patchVoiceStatusChip();
+    }
+
+    function parseRecognitionResults(e, sinceIndex = 0) {
+      let committed = '';
+      let interim = '';
+      let newFinal = '';
+      const start = Math.min(Math.max(0, sinceIndex), e.results.length);
+      for (let i = start; i < e.results.length; i++) {
+        const r = e.results[i];
+        const t = r[0]?.transcript || '';
+        if (r.isFinal) committed += t;
+        else interim += t;
+      }
+      for (let i = Math.max(e.resultIndex, start); i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) newFinal += r[0]?.transcript || '';
+      }
+      return {
+        display: (committed + interim).trim(),
+        newFinal: newFinal.trim(),
+        hasFinal: newFinal.trim().length > 0,
+      };
+    }
+
+    function pickEnVoice() {
+      const voices = speechSynthesis.getVoices();
+      return (
+        voices.find((v) => v.lang === 'en-US' && v.localService) ||
+        voices.find((v) => v.lang.startsWith('en')) ||
+        voices[0]
+      );
+    }
+
+    function speakStudentReply(msg) {
+      return new Promise((resolve) => {
+        const text = formatStudentTurnForHistory(msg);
+        if (!text) {
+          resolve();
+          return;
+        }
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'en-US';
+        const voice = pickEnVoice();
+        if (voice) u.voice = voice;
+        u.onend = resolve;
+        u.onerror = resolve;
+        speechSynthesis.cancel();
+        speechSynthesis.speak(u);
+      });
+    }
+
+    function scheduleListenRestart(delayMs = 600, { recreate = false } = {}) {
+      clearTimeout(listenRestartTimer);
+      listenRestartTimer = setTimeout(() => {
+        if (!state.voiceMode || state.busy || voiceSession.pendingSend) return;
+        if (recreate) recognition = null;
+        startListening();
+      }, delayMs);
+    }
+
+    function handleRecognitionNetworkError() {
+      if (!state.voiceMode) return;
+      networkRetryCount++;
+      if (networkRetryCount <= MAX_NETWORK_RETRIES) {
+        state.voiceStatus = 'reconnecting';
+        state.error = null;
+        stopListening({ resetSession: true });
+        render();
+        const delay = Math.min(500 * networkRetryCount, 5000);
+        scheduleListenRestart(delay);
+        return;
+      }
+      setError(
+        new Error(
+          'Browser speech recognition failed. Try Exit voice, refresh, and enter Voice mode again. You can still type and Send.'
+        )
+      );
+    }
+
+    function ensureRecognition() {
+      if (recognition) return recognition;
+      recognition = getSpeechRecognition();
+      if (!recognition) return null;
+
+      recognition.onresult = (e) => {
+        networkRetryCount = 0;
+        if (
+          !state.voiceMode ||
+          state.busy ||
+          voiceSession.pendingSend ||
+          voiceSession.inputPaused
+        ) {
+          return;
+        }
+        voiceSession.browserResultsLength = e.results.length;
+        const { display, newFinal, hasFinal } = parseRecognitionResults(
+          e,
+          voiceSession.browserResultsBaseline
+        );
+        if (display) {
+          updateLiveTranscript(display, !hasFinal);
+          scheduleVoiceSilenceSend();
+        }
+      };
+
+      recognition.onerror = (e) => {
+        if (e.error === 'aborted' || e.error === 'no-speech') return;
+        if (!state.voiceMode) return;
+        if (e.error === 'network') {
+          handleRecognitionNetworkError();
+          return;
+        }
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          setError(
+            new Error(
+              'Microphone or speech recognition is blocked. Allow the mic for this site in browser settings, then try again.'
+            )
+          );
+          return;
+        }
+        setError(new Error(`Speech recognition error: ${e.error}`));
+      };
+
+      recognition.onend = () => {
+        if (voiceSession.inputPaused) return;
+        if (voiceSession.suppressOnendTranscript) {
+          voiceSession.suppressOnendTranscript = false;
+          if (!state.voiceMode || voiceSession.pendingSend || state.busy) return;
+          scheduleListenRestart(600);
+          return;
+        }
+        if (!state.voiceMode || voiceSession.pendingSend || state.busy) return;
+        const pending = state.liveTranscript.trim();
+        if (isSubmittableTranscript(pending)) {
+          scheduleVoiceSilenceSend();
+          scheduleListenRestart(600);
+          return;
+        }
+        scheduleListenRestart(600);
+      };
+
+      return recognition;
+    }
+
+    function startListening() {
+      if (!state.voiceMode || state.busy || voiceSession.pendingSend || voiceSession.inputPaused) {
+        return;
+      }
+      const rec = ensureRecognition();
+      if (!rec) return;
+      try {
+        rec.start();
+        state.voiceStatus = 'listening';
+        patchVoiceStatusChip();
+      } catch (e) {
+        if (e.name === 'InvalidStateError') {
+          scheduleListenRestart(800, { recreate: true });
+          return;
+        }
+        setError(e);
+      }
+    }
+
+    function stopListening({ resetSession = false } = {}) {
+      clearTimeout(listenRestartTimer);
+      clearVoiceSilenceSendTimer();
+      if (!recognition) return;
+      try {
+        if (resetSession) recognition.abort();
+        else recognition.stop();
+      } catch (_) {
+        try {
+          recognition.abort();
+        } catch (_) {}
+      }
+      if (resetSession) recognition = null;
+    }
+
+    function teardownVoice() {
+      stopListening({ resetSession: true });
+      releaseMicStream();
+    }
+
+    async function enterVoiceMode(ttsEnabled) {
+      if (!SPEECH_RECOGNITION_SUPPORTED) {
+        setError(new Error('Voice mode requires a browser with Speech Recognition (Chrome or Edge).'));
+        return;
+      }
+      state.showVoicePrompt = false;
+      state.voiceMode = true;
+      state.voiceTtsEnabled = ttsEnabled;
+      state.voiceStatus = 'listening';
+      voiceSession.pendingSend = false;
+      voiceSession.suppressOnendTranscript = false;
+      voiceSession.inputPaused = false;
+      voiceSession.browserResultsBaseline = 0;
+      voiceSession.browserResultsLength = 0;
+      networkRetryCount = 0;
+      state.error = null;
+      clearLiveTranscript();
+      stopListening({ resetSession: true });
+      try {
+        await ensureMicStream();
+      } catch (e) {
+        state.voiceMode = false;
+        setError(new Error('Microphone access denied or unavailable. Allow the mic once for this site.'));
+        return;
+      }
+      render();
+      startListening();
+    }
+
+    function exitVoiceMode() {
+      teardownVoice();
+      speechSynthesis.cancel();
+      voiceSession.pendingSend = false;
+      voiceSession.suppressOnendTranscript = false;
+      voiceSession.inputPaused = false;
+      voiceSession.browserResultsBaseline = 0;
+      voiceSession.browserResultsLength = 0;
+      networkRetryCount = 0;
+      clearLiveTranscript();
+      state.voiceMode = false;
+      state.voiceTtsEnabled = false;
+      state.showVoicePrompt = false;
+      state.voiceStatus = '';
+      render();
+    }
+
+    function resetVoiceSessionState() {
+      teardownVoice();
+      speechSynthesis.cancel();
+      voiceSession.pendingSend = false;
+      voiceSession.suppressOnendTranscript = false;
+      voiceSession.inputPaused = false;
+      voiceSession.browserResultsBaseline = 0;
+      voiceSession.browserResultsLength = 0;
+      networkRetryCount = 0;
+      state.voiceMode = false;
+      state.voiceTtsEnabled = false;
+      state.showVoicePrompt = false;
+      state.voiceStatus = '';
+      state.liveTranscript = '';
+      state.liveTranscriptInterim = true;
+    }
+
+    function requestConfirm(message, action) {
+      state.confirmDialog = { message, action };
+      render();
+    }
+
+    function resolveConfirm(confirmed) {
+      const action = state.confirmDialog?.action;
+      state.confirmDialog = null;
+      if (confirmed && action) runConfirmAction(action);
+      else render();
+    }
+
+    function runConfirmAction(action) {
+      if (action === 'startOver') doStartOverSession();
+      else if (action === 'clearKey') {
+        saveKey('');
+        state.showSettingsModal = false;
+        state.statusLine = '';
+        render();
+      } else if (action === 'resetPrompts') {
+        resetPromptsToDefaults();
+        state.statusLine = 'Prompts reset to defaults.';
+        render();
+      } else {
+        render();
+      }
+    }
+
+    function doStartOverSession() {
+      const preserved = {
+        apiKey: state.apiKey,
+        model: state.model,
+        prompts: { ...state.prompts },
+        knowledgeProfile: state.knowledgeProfile,
+      };
+
+      resetVoiceSessionState();
+      scrollState.chatPinnedBottom = true;
+      scrollState.chatScrollTop = 0;
+      scrollState.memoryScrollTop = 0;
+
+      state.taughtNotes = [];
+      reloadBaselineNotes();
+      state.chat = [];
+      state.question = null;
+      state.showQuestionModal = true;
+      state.examAnswers = {};
+      state.examDeployComplete = false;
+      state.chatPanelTab = 'chat';
+      state.statusLine = 'Session reset.';
+      state.showSettingsModal = false;
+      state.apiKey = preserved.apiKey;
+      state.model = preserved.model;
+      state.prompts = preserved.prompts;
+      state.knowledgeProfile = preserved.knowledgeProfile;
+      reloadBaselineNotes();
+      render();
+    }
+
+    function startOverSession() {
+      if (state.busy) return;
+      requestConfirm(
+        'Start over? This clears chat, learned notes, the question, test answers, and grades. Baseline knowledge for your profile is kept. Your API key, model, knowledge profile, and AI prompts are kept.',
+        'startOver'
+      );
+    }
+
+    function voiceStatusLabel() {
+      switch (state.voiceStatus) {
+        case 'listening':
+          return 'Listening…';
+        case 'reconnecting':
+          return 'Reconnecting speech…';
+        case 'processing':
+          return 'Student thinking…';
+        case 'speaking':
+          return 'Speaking…';
+        default:
+          return '';
+      }
+    }
+
+    if (typeof speechSynthesis !== 'undefined') {
+      speechSynthesis.addEventListener('voiceschanged', () => {});
+    }
+
+    // =============================================================================
+    // ---- render ----
+    // =============================================================================
+
+    function renderAiFeaturesForm() {
+      const keyOk = !!state.apiKey;
+      const profile = getKnowledgeProfile();
+      return `
+        <p class="text-sm text-slate-400 mb-4">Edit your API key, knowledge profile, and Gemini system prompts. Prompt edits auto-save to this browser (localStorage) and persist after refresh. Edited prompts are highlighted in green.</p>
+        <label for="ai-settings-knowledge-profile" class="block text-xs text-slate-400 mb-1">Knowledge profile</label>
+        <select id="ai-settings-knowledge-profile" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-1 focus:ring-2 focus:ring-room-accent outline-none">
+          ${renderKnowledgeProfileOptions(state.knowledgeProfile)}
+        </select>
+        <p class="text-xs text-slate-500 mb-3">${escapeHtml(profile.description)}</p>
+        <label for="ai-settings-model-select" class="block text-xs text-slate-400 mb-1">Gemini model (free tier)</label>
+        <select id="ai-settings-model-select" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-3 focus:ring-2 focus:ring-room-accent outline-none">
+          ${FREE_TIER_MODELS.map((m) => `<option value="${escapeHtml(m.id)}" ${state.model === m.id ? 'selected' : ''}>${escapeHtml(m.label)} (${escapeHtml(m.id)})</option>`).join('')}
+        </select>
+        <label for="ai-settings-key-input" class="block text-xs text-slate-400 mb-1">Gemini API key</label>
+        <input type="password" id="ai-settings-key-input" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-4 focus:ring-2 focus:ring-room-accent outline-none" placeholder="${keyOk ? 'Leave blank to keep current key' : 'API key'}" />
+        <div class="space-y-4 mb-4">
+          ${PROMPT_FIELDS.map(
+            (f) => `
+            <div>
+              <label for="prompt-${f.key}" class="block text-xs font-medium text-slate-300 mb-0.5">
+                ${escapeHtml(f.label)}
+                <span id="prompt-badge-${f.key}" class="ml-1.5 text-emerald-400 font-normal ${isPromptCustomized(f.key) ? '' : 'hidden'}">· edited</span>
+              </label>
+              <p class="text-xs text-slate-500 mb-1">${escapeHtml(f.desc)}</p>
+              <textarea id="prompt-${f.key}" rows="6" class="${promptFieldClasses(f.key)}">${escapeHtml(state.prompts[f.key] || '')}</textarea>
+            </div>`
+          ).join('')}
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button type="button" id="btn-save-ai-features" class="flex-1 min-w-[8rem] bg-blue-600 hover:bg-blue-500 text-white font-medium py-2 rounded-lg">${keyOk ? 'Save settings' : 'Save & continue'}</button>
+          <button type="button" id="btn-reset-prompts" class="px-4 bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-2 rounded-lg">Reset prompts</button>
+          <button type="button" id="settings-cancel" class="px-4 bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-2 rounded-lg">Cancel</button>
+          ${keyOk ? '<button type="button" id="btn-clear-api-key" class="px-4 text-slate-400 hover:text-red-300 font-medium py-2 rounded-lg">Clear API key</button>' : ''}
+        </div>`;
+    }
+
+    function saveAiFeaturesFromForm() {
+      const modelEl = root.querySelector('#ai-settings-model-select');
+      const keyInp = root.querySelector('#ai-settings-key-input');
+      const profileEl = root.querySelector('#ai-settings-knowledge-profile');
+      saveModel(modelEl?.value || FREE_TIER_MODELS[0].id);
+      const keyVal = keyInp?.value?.trim();
+      if (!state.apiKey && !keyVal) return false;
+      if (keyVal) saveKey(keyVal);
+      const nextProfile = profileEl?.value;
+      if (nextProfile && nextProfile !== state.knowledgeProfile) {
+        setKnowledgeProfile(nextProfile, { clearTaught: false });
+      }
+      const prompts = {};
+      for (const f of PROMPT_FIELDS) {
+        const el = root.querySelector(`#prompt-${f.key}`);
+        if (el) prompts[f.key] = el.value;
+      }
+      savePrompts(prompts);
+      state.showSettingsModal = false;
+      state.statusLine = 'AI features settings saved.';
+      return true;
+    }
+
+    function render() {
+      saveScrollPositionsBeforeRender();
+      const keyOk = !!state.apiKey;
+      const showSettings = !keyOk || state.showSettingsModal;
+      const showVoicePrompt = state.showVoicePrompt;
+      const showQuestionModal = shouldShowQuestionModal();
+      const voiceStatusText = voiceStatusLabel();
+      const examInProgress = isExamInProgress();
+      const memoryBadge = formatMemoryBadgeLabel();
+      const knowledgeLabel = getKnowledgeProfile().label;
+
+      root.innerHTML = `
+        <div class="flex flex-col h-full overflow-hidden">
+        <!-- Custom confirm (window.confirm is blocked in sandboxed shared Canvas iframes) -->
+        <div class="fixed inset-0 z-[60] flex items-center justify-center p-4 ${state.confirmDialog ? '' : 'hidden'}" id="confirm-modal" aria-modal="true">
+          <div class="absolute inset-0 bg-black/70"></div>
+          <div class="relative bg-room-panel border border-slate-700 rounded-xl p-6 max-w-md w-full shadow-xl">
+            <p class="text-sm text-slate-300 mb-5">${state.confirmDialog ? escapeHtml(state.confirmDialog.message) : ''}</p>
+            <div class="flex gap-2 justify-end">
+              <button type="button" id="confirm-cancel" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium rounded-lg">Cancel</button>
+              <button type="button" id="confirm-ok" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg">Confirm</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Voice mode modal -->
+        <div class="fixed inset-0 z-50 flex items-center justify-center p-4 ${showVoicePrompt ? '' : 'hidden'}" id="voice-modal" aria-modal="true">
+          <div class="absolute inset-0 bg-black/70"></div>
+          <div class="relative bg-room-panel border border-slate-700 rounded-xl p-6 max-w-md w-full shadow-xl">
+            <h2 class="text-lg font-semibold text-white mb-2">Voice mode</h2>
+            <p class="text-sm text-slate-400 mb-4">Speak to teach the student using browser speech recognition. Your message sends after you pause (see below). Allow microphone access when prompted.</p>
+            <div class="mb-4">
+              <div class="flex items-center justify-between gap-3 mb-2">
+                <label for="voice-silence-slider" class="text-sm text-slate-300">Pause before send</label>
+                <span id="voice-silence-value" class="text-sm text-room-accent font-medium tabular-nums">${escapeHtml(formatVoiceSilenceLabel(state.voiceSilenceSendMs))}</span>
+              </div>
+              <input type="range" id="voice-silence-slider" class="w-full accent-room-accent" min="500" max="5000" step="250" value="${state.voiceSilenceSendMs}" />
+              <p class="text-xs text-slate-500 mt-1.5">How long to wait after you stop speaking before sending (0.5–5 s). Longer helps with filler words and mid-sentence pauses.</p>
+            </div>
+            <p class="text-sm text-slate-300 mb-3">Should the student read replies aloud? (browser text-to-speech)</p>
+            <div class="flex flex-col gap-2 mb-3">
+              <button type="button" id="voice-tts-yes" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-2 rounded-lg">Yes, read replies aloud</button>
+              <button type="button" id="voice-tts-no" class="w-full bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-2 rounded-lg">No, text only</button>
+            </div>
+            <button type="button" id="voice-prompt-cancel" class="w-full text-slate-400 hover:text-white text-sm py-2">Cancel</button>
+          </div>
+        </div>
+
+        <!-- AI Features Settings modal -->
+        <div class="fixed inset-0 z-50 flex items-center justify-center p-4 ${showSettings ? '' : 'hidden'}" id="ai-features-modal" aria-modal="true">
+          <div class="absolute inset-0 bg-black/70"></div>
+          <div class="relative bg-room-panel border border-slate-700 rounded-xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-xl">
+            <button type="button" id="settings-close-x" class="absolute top-4 right-4 w-8 h-8 flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 text-xl leading-none" aria-label="Close settings">×</button>
+            <h2 class="text-lg font-semibold text-white mb-2 pr-10">AI Features Settings</h2>
+            ${renderAiFeaturesForm()}
+          </div>
+        </div>
+
+        <!-- Question setup modal -->
+        <div class="fixed inset-0 z-50 flex items-center justify-center p-4 ${showQuestionModal ? '' : 'hidden'}" id="question-modal" aria-modal="true">
+          <div class="absolute inset-0 bg-black/70"></div>
+          <div class="relative bg-room-panel border border-slate-700 rounded-xl p-6 max-w-lg w-full shadow-xl">
+            <h2 class="text-lg font-semibold text-white mb-2">Set up your question</h2>
+            <p class="text-sm text-slate-400 mb-4">Choose a student knowledge profile and paste the homework question below. Optionally paste a reference answer — if left empty, the model will infer one for grading.</p>
+            <label for="question-knowledge-profile" class="block text-xs text-slate-400 mb-1">Knowledge profile</label>
+            <select id="question-knowledge-profile" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-1 focus:ring-2 focus:ring-room-accent outline-none">
+              ${renderKnowledgeProfileOptions(state.knowledgeProfile)}
+            </select>
+            <p class="text-xs text-slate-500 mb-3">${escapeHtml(getKnowledgeProfile().description)}</p>
+            <label for="question-prompt-input" class="block text-xs text-slate-400 mb-1">Question</label>
+            <textarea id="question-prompt-input" rows="5" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-3 focus:ring-2 focus:ring-room-accent outline-none resize-y" placeholder="Paste the question here…">${state.question ? escapeHtml(state.question.prompt) : ''}</textarea>
+            <label for="question-answer-input" class="block text-xs text-slate-400 mb-1">Reference answer <span class="text-slate-500">(optional)</span></label>
+            <textarea id="question-answer-input" rows="4" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-4 focus:ring-2 focus:ring-room-accent outline-none resize-y" placeholder="Paste the expected answer, or leave blank to infer…">${state.question ? escapeHtml(state.question.referenceAnswer) : ''}</textarea>
+            <div class="flex gap-2">
+              <button type="button" id="btn-question-continue" class="flex-1 bg-room-accent hover:bg-blue-500 text-white font-medium py-2 rounded-lg disabled:opacity-50" ${state.busy ? 'disabled' : ''}>Continue</button>
+              ${state.question ? '<button type="button" id="btn-question-cancel" class="px-4 bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-2 rounded-lg">Cancel</button>' : ''}
+            </div>
+          </div>
+        </div>
+
+        <header class="shrink-0 border-b border-slate-800 bg-room-panel/80 backdrop-blur z-40">
+          <div class="max-w-[1600px] mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-3">
+              <h1 class="text-lg font-semibold tracking-tight">AI Student <span class="text-room-accent">Observation Room</span></h1>
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-600" title="Knowledge profile">${escapeHtml(knowledgeLabel)}</span>
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-600" title="Hidden internal notes count">Memory: ${escapeHtml(memoryBadge)}</span>
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-600" title="Selected Gemini model">Model: ${escapeHtml(state.model)}</span>
+            </div>
+            <div class="flex items-center gap-2 text-xs">
+              ${state.statusLine ? `<span class="text-amber-400/90">${escapeHtml(state.statusLine)}</span>` : ''}
+              ${state.busy ? `<span class="text-blue-300 animate-pulse">${escapeHtml(state.busyLabel || 'Working…')}</span>` : ''}
+              ${state.question ? `<button type="button" id="btn-edit-question" class="text-slate-400 hover:text-white underline-offset-2 hover:underline" ${state.busy ? 'disabled' : ''}>Edit question</button>` : ''}
+              <button type="button" id="btn-start-over" class="px-2.5 py-1 rounded-lg border border-slate-600 text-slate-300 hover:text-white hover:border-slate-500 disabled:opacity-40" ${state.busy ? 'disabled' : ''} title="Clear session and start fresh">Start over</button>
+              <button type="button" id="btn-ai-features-settings" class="text-slate-400 hover:text-white underline-offset-2 hover:underline">AI Features Settings</button>
+            </div>
+          </div>
+        </header>
+
+        ${state.error ? `<div class="shrink-0 max-w-[1600px] mx-auto px-4 pt-3 w-full"><div class="bg-red-900/40 border border-red-700 text-red-200 text-sm rounded-lg px-3 py-2">${escapeHtml(state.error)}</div></div>` : ''}
+
+        <main class="flex-1 min-h-0 max-w-[1600px] mx-auto px-4 py-4 flex flex-col w-full overflow-hidden">
+          <section class="flex-1 min-h-0 flex flex-col bg-room-panel border border-slate-800 rounded-xl overflow-hidden">
+            <div class="shrink-0 flex border-b border-slate-800">
+              ${['chat', 'memory']
+                .map(
+                  (t) =>
+                    `<button type="button" data-chat-tab="${t}" class="flex-1 px-4 py-2 text-sm border-b-2 ${
+                      state.chatPanelTab === t
+                        ? 'border-room-accent text-white bg-room-bg/50'
+                        : 'border-transparent text-slate-400 hover:text-slate-200'
+                    }">${t === 'chat' ? 'Chat' : `Memory (${getMemoryNoteCount()})`}</button>`
+                )
+                .join('')}
+            </div>
+            ${
+              state.chatPanelTab === 'chat'
+                ? `
+            <div class="relative flex-1 min-h-0 flex flex-col overflow-hidden">
+              <div id="chat-scroll" class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 space-y-3">
+                ${renderChatMessagesHtml()}
+              </div>
+              <button type="button" id="btn-scroll-chat-bottom" class="hidden absolute bottom-4 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-full bg-slate-700 hover:bg-slate-600 border border-slate-500 text-slate-200 text-xs font-medium shadow-lg" title="Jump to latest messages">↓ Latest</button>
+            </div>
+            <div class="shrink-0 p-3 border-t border-slate-800">
+              ${state.voiceMode && voiceStatusText ? `<div class="mb-2 flex items-center gap-2 flex-wrap"><span id="voice-status-chip" class="text-xs px-2 py-1 rounded-full border ${state.voiceStatus === 'reconnecting' ? 'bg-amber-900/40 border-amber-700/50 text-amber-200' : 'bg-emerald-900/40 border-emerald-700/50 text-emerald-200'} ${state.voiceStatus === 'listening' ? 'animate-pulse' : ''}">${escapeHtml(voiceStatusText)}</span><span class="text-xs text-slate-500">Browser speech</span><span class="text-xs text-slate-500">${escapeHtml(formatVoiceSilenceLabel(state.voiceSilenceSendMs))} pause</span>${state.voiceTtsEnabled ? '<span class="text-xs text-slate-500">Browser TTS on</span>' : '<span class="text-xs text-slate-500">TTS off</span>'}</div>` : ''}
+              <div class="flex gap-2">
+                <textarea id="teacher-input" rows="2" class="flex-1 bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm resize-none focus:ring-2 focus:ring-room-accent outline-none" placeholder="${state.voiceMode ? 'Speak or type your lesson…' : 'Explain a concept to the student…'}" ${state.busy && !state.voiceMode ? 'disabled' : ''} ${state.voiceMode && state.busy ? 'readonly' : ''}></textarea>
+                <div class="flex flex-col gap-1 self-end shrink-0">
+                  <button type="button" id="btn-deploy" class="px-3 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-medium rounded-lg disabled:opacity-50" ${state.busy || !state.question || examInProgress ? 'disabled' : ''} title="Deploy exam for the AI student">Deploy exam</button>
+                  <button type="button" id="btn-send" class="px-4 py-2 bg-room-accent hover:bg-blue-500 text-white text-sm font-medium rounded-lg disabled:opacity-50" ${state.busy ? 'disabled' : ''}>Send</button>
+                  ${state.voiceMode ? `<button type="button" id="btn-exit-voice" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-medium rounded-lg">Exit voice</button>` : `<button type="button" id="btn-voice-mode" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-medium rounded-lg disabled:opacity-40" ${keyOk && SPEECH_RECOGNITION_SUPPORTED ? '' : 'disabled'} title="Hands-free voice teaching (browser speech)">Voice mode</button>`}
+                </div>
+              </div>
+            </div>`
+                : `
+            <div id="memory-scroll" class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 space-y-3">
+              <p class="text-xs text-slate-500 mb-2">Hidden notes the exam student can access. Baseline and learned notes are merged for the model — only this tab shows the split.</p>
+              ${renderMemoryPanel()}
+            </div>`
+            }
+          </section>
+        </main>
+
+        <footer class="shrink-0 max-w-[1600px] mx-auto px-4 py-2 text-center text-xs text-slate-600">
+          Single-question mode — open <span class="text-slate-500">chat-single.html</span> locally (HTTPS or localhost recommended for Voice mode). Uses Gemini REST API. Session resets on refresh.
+          ${!SPEECH_RECOGNITION_SUPPORTED ? '<span class="block mt-1 text-slate-500">Voice mode requires a browser with Speech Recognition (Chrome or Edge).</span>' : ''}
+        </footer>
+        </div>
+      `;
+
+      wireEvents();
+      wireScrollHandlers();
+      applyScrollPositionsAfterRender();
+    }
+
+    function buildExamItemsList() {
+      if (!state.question) return [];
+      const q = state.question;
+      const questionType = q.questionType || 'open_response';
+      return [{
+        id: 'q1',
+        kind: 'question',
+        label: q.topic || 'Question',
+        displayNumber: '1',
+        parentId: '',
+        partLabel: '',
+        parentContext: '',
+        prompt: q.prompt,
+        questionType,
+        choices: q.choices || [],
+        correctChoiceId: q.correctChoiceId || '',
+        goldenBullets: (q.goldenBullets || []).map((b) => String(b).trim()).filter(Boolean),
+        answerDepth: questionType === 'open_response' ? (q.answerDepth || normalizeAnswerDepth(q, questionType)) : '',
+      }];
+    }
+
+    function wireEvents() {
+      root.querySelector('#confirm-ok')?.addEventListener('click', () => resolveConfirm(true));
+      root.querySelector('#confirm-cancel')?.addEventListener('click', () => resolveConfirm(false));
+      root.querySelector('#btn-save-ai-features')?.addEventListener('click', () => {
+        if (saveAiFeaturesFromForm()) render();
+      });
+      root.querySelector('#settings-close-x')?.addEventListener('click', () => {
+        state.showSettingsModal = false;
+        render();
+      });
+      root.querySelector('#settings-cancel')?.addEventListener('click', () => {
+        state.showSettingsModal = false;
+        render();
+      });
+      root.querySelector('#btn-clear-api-key')?.addEventListener('click', () => {
+        requestConfirm('Clear stored API key?', 'clearKey');
+      });
+      root.querySelector('#btn-reset-prompts')?.addEventListener('click', () => {
+        requestConfirm('Reset all prompts to their built-in defaults? This cannot be undone.', 'resetPrompts');
+      });
+      root.querySelector('#btn-ai-features-settings')?.addEventListener('click', () => {
+        state.showSettingsModal = true;
+        render();
+      });
+      root.querySelector('#btn-start-over')?.addEventListener('click', startOverSession);
+      root.querySelector('#btn-edit-question')?.addEventListener('click', openEditQuestionModal);
+      root.querySelector('#btn-question-continue')?.addEventListener('click', () => {
+        void onQuestionSetupSubmit();
+      });
+      root.querySelector('#btn-question-cancel')?.addEventListener('click', () => {
+        state.showQuestionModal = false;
+        render();
+      });
+
+      wirePromptEditorEvents();
+
+      root.querySelectorAll('[data-chat-tab]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.chatPanelTab = btn.getAttribute('data-chat-tab');
+          render();
+        });
+      });
+
+      root.querySelector('#btn-send')?.addEventListener('click', onTeacherSend);
+      root.querySelector('#teacher-input')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          onTeacherSend();
+        }
+      });
+
+      root.querySelector('#btn-voice-mode')?.addEventListener('click', () => {
+        if (!state.apiKey) {
+          state.showSettingsModal = true;
+          render();
+          return;
+        }
+        if (!SPEECH_RECOGNITION_SUPPORTED) {
+          setError(new Error('Voice mode requires a browser with Speech Recognition (Chrome or Edge).'));
+          return;
+        }
+        state.showVoicePrompt = true;
+        render();
+      });
+      root.querySelector('#voice-tts-yes')?.addEventListener('click', () => {
+        void enterVoiceMode(true);
+      });
+      root.querySelector('#voice-tts-no')?.addEventListener('click', () => {
+        void enterVoiceMode(false);
+      });
+      root.querySelector('#voice-silence-slider')?.addEventListener('input', (e) => {
+        saveVoiceSilenceSendMs(Number(e.target.value));
+        const label = root.querySelector('#voice-silence-value');
+        if (label) label.textContent = formatVoiceSilenceLabel(state.voiceSilenceSendMs);
+      });
+      root.querySelector('#voice-prompt-cancel')?.addEventListener('click', () => {
+        state.showVoicePrompt = false;
+        render();
+      });
+      root.querySelector('#btn-exit-voice')?.addEventListener('click', exitVoiceMode);
+
+      root.querySelector('#btn-deploy')?.addEventListener('click', onDeployExam);
+      root.querySelector('#btn-grade')?.addEventListener('click', onGradeAll);
+      root.querySelector('#btn-teaching-feedback')?.addEventListener('click', onAskTeachingFeedback);
+    }
+
+    // =============================================================================
+    // ---- handlers ----
+    // =============================================================================
+    async function sendTeacherText(text) {
+      const trimmed = (text || '').trim();
+      let turnStarted = false;
+      try {
+        if (!trimmed || state.busy) return;
+        if (!state.apiKey) {
+          setError(new Error('Missing API key'));
+          return;
+        }
+
+        turnStarted = true;
+        if (!state.voiceMode) uiState.restoreTeacherInputFocus = true;
+        pauseVoiceCapture();
+        scrollState.chatPinnedBottom = true;
+
+        state.chat.push({ role: 'teacher', text: trimmed });
+        const ta = root.querySelector('#teacher-input');
+        if (ta) ta.value = '';
+        setBusy(true, 'Student thinking…');
+
+        const prior = state.chat.slice(0, -1);
+        const userText = buildTeachingUserPayload(trimmed, prior);
+        const raw = await callGemini({
+          systemInstruction: state.prompts.teaching,
+          userText,
+          responseJson: true,
+        });
+        const parsed = parseJsonLoose(raw);
+        const notes = parsed.internalNotes || {};
+        const facts = Array.isArray(notes.facts) ? notes.facts.filter((f) => typeof f === 'string') : [];
+        const links = Array.isArray(notes.links) ? notes.links.filter((l) => typeof l === 'string') : [];
+        if (facts.length || links.length) {
+          state.taughtNotes.push({
+            concept: String(notes.concept || '').trim(),
+            facts,
+            links,
+          });
+        }
+        const studentMsg = {
+          role: 'student',
+          thinking: String(parsed.thinking || '').trim(),
+          shortReply: String(parsed.shortReply || '…').trim(),
+          notesLogSource: parseNotesLogSource(parsed),
+        };
+        state.chat.push(studentMsg);
+
+        if (state.voiceMode && state.voiceTtsEnabled) {
+          state.busy = false;
+          state.busyLabel = '';
+          state.voiceStatus = 'speaking';
+          render();
+          await speakStudentReply(studentMsg);
+        }
+      } catch (e) {
+        if (state.chat.length && state.chat[state.chat.length - 1]?.role === 'teacher') {
+          state.chat.pop();
+        }
+        setError(e);
+      } finally {
+        state.busy = false;
+        state.busyLabel = '';
+        if (!turnStarted) {
+          voiceSession.pendingSend = false;
+          voiceSession.suppressOnendTranscript = false;
+          voiceSession.inputPaused = false;
+          if (!state.voiceMode) render();
+          return;
+        }
+        if (state.voiceMode) {
+          resumeVoiceInput();
+        } else {
+          voiceSession.pendingSend = false;
+          render();
+        }
+      }
+    }
+
+    async function onTeacherSend() {
+      const ta = root.querySelector('#teacher-input');
+      const text = ta?.value?.trim();
+      if (!text || state.busy) return;
+      if (state.voiceMode) {
+        clearLiveTranscript();
+        voiceSession.suppressOnendTranscript = true;
+        pauseVoiceCapture();
+      }
+      await sendTeacherText(text);
+    }
+
+    async function onQuestionSetupSubmit() {
+      const promptEl = root.querySelector('#question-prompt-input');
+      const answerEl = root.querySelector('#question-answer-input');
+      const profileEl = root.querySelector('#question-knowledge-profile');
+      const prompt = promptEl?.value?.trim();
+      if (!prompt || state.busy) return;
+      if (!state.apiKey) {
+        setError(new Error('Missing API key'));
+        return;
+      }
+
+      const nextProfile = profileEl?.value;
+      if (nextProfile && nextProfile !== state.knowledgeProfile) {
+        const hasSessionProgress =
+          state.taughtNotes.length > 0 || state.chat.some((m) => m.role === 'student');
+        setKnowledgeProfile(nextProfile, { clearTaught: !hasSessionProgress });
+      }
+
+      const referenceAnswer = answerEl?.value?.trim() || '';
+      setBusy(true, referenceAnswer ? 'Building rubric from answer…' : 'Finding model answer…');
+      try {
+        let parsed;
+        if (referenceAnswer) {
+          const raw = await callGemini({
+            systemInstruction: state.prompts.answerFromTeacher,
+            userText: `QUESTION:\n${prompt}\n\nTEACHER'S REFERENCE ANSWER:\n${referenceAnswer}`,
+            responseJson: true,
+          });
+          parsed = parseJsonLoose(raw);
+        } else {
+          const raw = await callGemini({
+            systemInstruction: state.prompts.answerInference,
+            userText: `QUESTION:\n${prompt}`,
+            responseJson: true,
+          });
+          parsed = parseJsonLoose(raw);
+        }
+
+        const question = buildQuestionFromParsed(parsed, prompt, referenceAnswer);
+        if (question.questionType === 'open_response' && !question.goldenBullets.length) {
+          throw new Error('Could not build a grading rubric for this question. Try pasting a reference answer.');
+        }
+
+        state.question = question;
+        state.showQuestionModal = false;
+        state.examAnswers = {};
+        state.examDeployComplete = false;
+        state.grades = [];
+        state.teachingFeedback = null;
+        removeExamBlocksFromChat();
+        state.statusLine = 'Question ready. Teach the student, then Deploy exam.';
+      } catch (e) {
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function onDeployExam() {
+      if (!state.question || state.busy) return;
+      const items = orderExamItemsForDeploy(buildExamItemsList());
+      state.examAnswers = {};
+      state.examDeployComplete = false;
+      state.grades = [];
+      state.teachingFeedback = null;
+      state.chatPanelTab = 'chat';
+      scrollState.chatPinnedBottom = true;
+      const block = startExamChatBlock();
+
+      setBusy(true, 'Running exam…');
+      try {
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          state.busyLabel = `Running exam (${i + 1}/${items.length})…`;
+
+          block.items.push({
+            questionId: item.id,
+            label: item.label,
+            displayNumber: item.displayNumber,
+            parentId: item.parentId,
+            partLabel: item.partLabel,
+            parentContext: item.parentContext,
+            prompt: item.prompt,
+            questionType: item.questionType,
+            answerDepth: item.answerDepth,
+            choices: item.choices,
+            answer: null,
+            grade: null,
+          });
+          render();
+
+          const raw = await callGemini({
+            systemInstruction: state.prompts.studentExam,
+            userText: buildExamUserMessage(item),
+            responseJson: true,
+            temperature: 0.15,
+          });
+          let parsed = {};
+          try {
+            parsed = parseJsonLoose(raw);
+          } catch {
+            parsed = { examAnswer: String(raw).trim(), memoryNotesUsed: [] };
+          }
+          const answerObj = buildExamAnswerFromParsed(item, parsed);
+          state.examAnswers[item.id] = answerObj;
+          block.items[block.items.length - 1].answer = answerObj;
+          render();
+        }
+        block.inProgress = false;
+        state.examDeployComplete = items.length > 0 && items.every((it) => state.examAnswers[it.id] != null);
+        state.statusLine = state.examDeployComplete
+          ? 'Exam complete. Review answers in Chat, then Grade.'
+          : 'Exam finished with missing answers. Deploy again before grading.';
+        render();
+      } catch (e) {
+        const blockOnError = getExamChatBlock();
+        if (blockOnError) blockOnError.inProgress = false;
+        state.examDeployComplete = false;
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function onGradeAll() {
+      const items = buildExamItemsList();
+      if (!items.length || state.busy || !state.examDeployComplete) return;
+
+      setBusy(true, 'Grading…');
+      state.grades = [];
+      state.teachingFeedback = null;
+      state.chatPanelTab = 'chat';
+      scrollState.chatPinnedBottom = true;
+      try {
+        for (const item of items) {
+          const answer = state.examAnswers[item.id];
+          const studentAnswer = getExamAnswerText(answer);
+
+          if (item.questionType === 'multiple_choice') {
+            const selected =
+              typeof answer === 'object' ? String(answer?.selectedChoiceId || '').trim().toUpperCase() : '';
+            const correct = String(item.correctChoiceId || '').trim().toUpperCase();
+            const isCorrect = selected && correct && selected === correct;
+            state.grades.push({
+              questionId: item.id,
+              questionType: 'multiple_choice',
+              hitBullets: isCorrect ? [0] : [],
+              missedBullets: isCorrect ? [] : [0],
+              pointsEarned: isCorrect ? 1 : 0,
+              pointsPossible: 1,
+              feedback: isCorrect
+                ? `Correct — selected ${selected}.`
+                : `Incorrect — selected ${selected || 'UNKNOWN'}; correct answer is ${correct || '?'}.`,
+              studentAnswer,
+              selectedChoiceId: selected,
+              correctChoiceId: correct,
+            });
+            applyGradesToExamChat([state.grades[state.grades.length - 1]]);
+            render();
+            continue;
+          }
+
+          const rubric = (item.goldenBullets || []).filter(Boolean);
+          if (!rubric.length) {
+            state.grades.push({
+              questionId: item.id,
+              questionType: 'open_response',
+              hitBullets: [],
+              missedBullets: [],
+              pointsEarned: 0,
+              pointsPossible: 0,
+              ungraded: true,
+              feedback:
+                'No grading rubric (goldenBullets) for this question. Edit the question and provide a reference answer, or re-run setup with answer inference.',
+              studentAnswer,
+              goldenBullets: [],
+            });
+            applyGradesToExamChat([state.grades[state.grades.length - 1]]);
+            state.busyLabel = `Grading (${state.grades.length}/${items.length})…`;
+            render();
+            continue;
+          }
+
+          const raw = await callGemini({
+            systemInstruction: state.prompts.grader,
+            userText: buildGraderUserContent({ ...item, goldenBullets: rubric }, studentAnswer),
+            responseJson: true,
+          });
+          const g = parseJsonLoose(raw);
+          const possible = rubric.length;
+          const hits = normalizeHitBullets(g.hitBullets, possible);
+          const missed = [];
+          for (let i = 0; i < possible; i++) {
+            if (!hits.includes(i)) missed.push(i);
+          }
+          const earned = hits.length;
+          state.grades.push({
+            questionId: g.questionId || item.id,
+            questionType: 'open_response',
+            hitBullets: hits,
+            missedBullets: missed,
+            pointsEarned: earned,
+            pointsPossible: possible,
+            feedback: g.feedback || '',
+            studentAnswer,
+            goldenBullets: rubric,
+          });
+          applyGradesToExamChat([state.grades[state.grades.length - 1]]);
+          state.busyLabel = `Grading (${state.grades.length}/${items.length})…`;
+          render();
+        }
+        state.statusLine = 'Grading complete.';
+        render();
+      } catch (e) {
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function onAskTeachingFeedback() {
+      if (!state.grades.length || state.busy) return;
+      if (!state.apiKey) {
+        setError(new Error('Missing API key'));
+        return;
+      }
+
+      setBusy(true, 'Generating teaching feedback…');
+      try {
+        const raw = await callGemini({
+          systemInstruction: state.prompts.teachingFeedback,
+          userText: buildTeachingFeedbackUserContent(),
+          responseJson: true,
+        });
+        const parsed = parseJsonLoose(raw);
+        const tips = Array.isArray(parsed.tips)
+          ? parsed.tips.map((t) => String(t).trim()).filter(Boolean).slice(0, 3)
+          : [];
+        if (tips.length < 3) {
+          throw new Error('Expected 3 feedback tips from the model.');
+        }
+        state.teachingFeedback = { tips };
+        state.statusLine = 'Teaching feedback ready.';
+        render();
+      } catch (e) {
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    // =============================================================================
+    // ---- bootstrap ----
+    // =============================================================================
+    loadSettings();
+    render();
+  </script>
+</body>
+</html>
